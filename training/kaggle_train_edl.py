@@ -28,7 +28,9 @@ from torch_geometric.nn import SAGEConv, GATConv, GCNConv, GraphNorm, InstanceNo
 from safetensors.torch import save_file
 from huggingface_hub import HfApi, login
 
-HF_TOKEN = os.environ.get("HF_TOKEN", "")
+HF_TOKEN = "PLACEHOLDER_HF_TOKEN"
+if HF_TOKEN == "PLACEHOLDER_HF_TOKEN":
+    HF_TOKEN = os.environ.get("HF_TOKEN", "")
 if not HF_TOKEN:
     try:
         from kaggle_secrets import UserSecretsClient
