@@ -1,0 +1,12 @@
+{
+  "id": "anamitrasarkar007/trustworthy-gnn-edl-training",
+  "title": "Trustworthy GNN EDL Training",
+  "code_file": "kaggle_train_edl.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": ["ellipticco/elliptic-data-set"],
+  "competition_sources": []
+}
