@@ -35,10 +35,35 @@ from huggingface_hub import HfApi, login
 
 # ── Config ──
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
+if not HF_TOKEN:
+    try:
+        from kaggle_secrets import UserSecretsClient
+        HF_TOKEN = UserSecretsClient().get_secret("HF_TOKEN")
+    except Exception:
+        pass
+
+if not HF_TOKEN:
+    local_path = "/home/anamitra/Downloads/API_Keys_and_Secrets/hf_token"
+    if os.path.exists(local_path):
+        try:
+            with open(local_path) as f:
+                HF_TOKEN = f.read().strip()
+        except Exception:
+            pass
+
+if not HF_TOKEN:
+    raise ValueError("HF_TOKEN is not set in environment or Kaggle User Secrets!")
+
 HF_REPO = "Arko007/trustworthy-gnn-fraud-models"
 DATA_DIR = "/kaggle/input/elliptic-data-set/elliptic_bitcoin_dataset"
-if not os.path.exists(DATA_DIR):
+if not os.path.exists(os.path.join(DATA_DIR, "elliptic_txs_features.csv")):
     DATA_DIR = "/kaggle/input/elliptic-data-set"
+if not os.path.exists(os.path.join(DATA_DIR, "elliptic_txs_features.csv")):
+    for fallback in [".", "data", "../data", "/home/anamitra/Data_and_Logs"]:
+        if os.path.exists(os.path.join(fallback, "elliptic_txs_features.csv")):
+            DATA_DIR = fallback
+            break
+
 EPOCHS = 200
 PATIENCE = 15
 LR = 1e-3
@@ -118,12 +143,13 @@ def load_elliptic():
 
 
 # ── Graph Topology Builders ──
-def build_similarity_graph(x, threshold=0.92, batch_size=5000):
+def build_similarity_graph(x, threshold=0.92, batch_size=1000):
     num_nodes = x.shape[0]
     src, dst = [], []
+    x_f32 = x.astype(np.float32)
     for start in range(0, num_nodes, batch_size):
         end = min(start + batch_size, num_nodes)
-        sim = cosine_similarity(x[start:end], x)
+        sim = cosine_similarity(x_f32[start:end], x_f32)
         rows, cols = np.where(sim > threshold)
         rows += start
         mask = rows != cols
@@ -134,37 +160,43 @@ def build_similarity_graph(x, threshold=0.92, batch_size=5000):
     return torch.tensor([src, dst], dtype=torch.long)
 
 def build_knn_graph(x, k=5):
-    nn_model = NearestNeighbors(n_neighbors=k + 1, metric='euclidean')
+    nn_model = NearestNeighbors(n_neighbors=k + 1, metric='euclidean', n_jobs=-1)
     nn_model.fit(x)
     _, indices = nn_model.kneighbors(x)
-    src, dst = [], []
-    for i in range(len(x)):
-        for j in indices[i, 1:]:
-            src.extend([i, j])
-            dst.extend([j, i])
+    
+    num_nodes = len(x)
+    row_indices = np.repeat(np.arange(num_nodes), k)
+    col_indices = indices[:, 1:].flatten()
+    
+    src = np.concatenate([row_indices, col_indices])
+    dst = np.concatenate([col_indices, row_indices])
+    
     edge_index = torch.tensor([src, dst], dtype=torch.long)
     return torch.unique(edge_index, dim=1)
 
 def build_temporal_snap_graph(x, timesteps, k=3):
     unique_times = np.sort(np.unique(timesteps))
-    src, dst = [], []
+    src_list, dst_list = [], []
     for i in range(len(unique_times) - 1):
         idx_curr = np.where(timesteps == unique_times[i])[0]
         idx_next = np.where(timesteps == unique_times[i + 1])[0]
         if len(idx_next) == 0 or len(idx_curr) == 0:
             continue
         actual_k = min(k, len(idx_next))
-        nn_model = NearestNeighbors(n_neighbors=actual_k, metric='euclidean')
+        nn_model = NearestNeighbors(n_neighbors=actual_k, metric='euclidean', n_jobs=-1)
         nn_model.fit(x[idx_next])
         _, indices = nn_model.kneighbors(x[idx_curr])
-        for li, gi in enumerate(idx_curr):
-            for lj in indices[li]:
-                gj = idx_next[lj]
-                src.extend([gi, gj])
-                dst.extend([gj, gi])
-    if not src:
+        
+        gi = np.repeat(idx_curr, actual_k)
+        gj = idx_next[indices.flatten()]
+        
+        src_list.extend(np.concatenate([gi, gj]))
+        dst_list.extend(np.concatenate([gj, gi]))
+        
+    if not src_list:
         return torch.zeros((2, 0), dtype=torch.long)
-    return torch.unique(torch.tensor([src, dst], dtype=torch.long), dim=1)
+    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
+    return torch.unique(edge_index, dim=1)
 
 def build_augmented_graph(original_ei, x, threshold=0.92):
     sim_ei = build_similarity_graph(x, threshold)

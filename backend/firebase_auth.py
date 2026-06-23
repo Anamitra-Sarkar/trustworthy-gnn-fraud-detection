@@ -27,7 +27,7 @@ def init_firebase():
         raise RuntimeError("No Firebase credentials found")
 
     _app = firebase_admin.initialize_app(cred)
-    _db = firestore.client()
+    _db = firestore.client(database_id="default")
 
 
 def get_db():
