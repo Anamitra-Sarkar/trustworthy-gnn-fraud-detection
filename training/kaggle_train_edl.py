@@ -31,6 +31,8 @@ from huggingface_hub import HfApi, login
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 HF_REPO = "Arko007/trustworthy-gnn-fraud-models"
 DATA_DIR = "/kaggle/input/elliptic-data-set/elliptic_bitcoin_dataset"
+if not os.path.exists(DATA_DIR):
+    DATA_DIR = "/kaggle/input/elliptic-data-set"
 EPOCHS = 200
 PATIENCE = 15
 LR = 1e-3
