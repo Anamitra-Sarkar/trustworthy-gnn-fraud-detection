@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: trustworthy-gnn-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    region: oregon
+    rootDir: backend
+    envVars:
+      - key: PORT
+        value: 7860
+      - key: MODEL_DIR
+        value: /tmp/models
+      - key: CONFORMAL_ALPHA
+        value: "0.1"
+      - key: MC_DROPOUT_T
+        value: "50"
+    healthCheckPath: /api/health
+    autoDeploy: true
