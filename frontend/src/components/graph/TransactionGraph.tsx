@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useCallback } from "react";
+import type { Core, EventObjectNode, LayoutOptions } from "cytoscape";
 import type { GraphNode, GraphEdge } from "@/types";
 
 interface TransactionGraphProps {
@@ -24,8 +25,7 @@ export default function TransactionGraph({
   layout = "cose",
 }: TransactionGraphProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const cyRef = useRef<any>(null);
+  const cyRef = useRef<Core | null>(null);
 
   const initGraph = useCallback(async () => {
     if (!containerRef.current || nodes.length === 0) return;
@@ -55,6 +55,15 @@ export default function TransactionGraph({
         },
       })),
     ];
+
+    const layoutOptions: LayoutOptions = {
+      name: layout,
+      animate: false,
+      randomize: layout === "cose",
+      nodeRepulsion: () => 8000,
+      idealEdgeLength: () => 80,
+      gravity: 0.3,
+    };
 
     const cy = cytoscape({
       container: containerRef.current,
@@ -104,20 +113,12 @@ export default function TransactionGraph({
           },
         },
       ],
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      layout: {
-        name: layout,
-        animate: false,
-        randomize: layout === "cose",
-        nodeRepulsion: () => 8000,
-        idealEdgeLength: () => 80,
-        gravity: 0.3,
-      } as any,
+      layout: layoutOptions,
       minZoom: 0.2,
       maxZoom: 5,
     });
 
-    cy.on("tap", "node", (evt: { target: { data: () => Record<string, unknown> } }) => {
+    cy.on("tap", "node", (evt: EventObjectNode) => {
       const nodeData = evt.target.data();
       if (onNodeSelect) {
         onNodeSelect({

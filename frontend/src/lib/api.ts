@@ -80,6 +80,10 @@ export const api = {
     return request(`/api/escalations${query}`);
   },
 
+  getModelSummary() {
+    return request("/api/models/summary");
+  },
+
   getDemoData() {
     return request("/api/demo/elliptic");
   },

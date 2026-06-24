@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   BarChart,
   Bar,
@@ -20,76 +20,58 @@ import {
 } from "lucide-react";
 import Header from "@/components/layout/Header";
 import { cn } from "@/lib/utils";
+import { api } from "@/lib/api";
+import { useAuth } from "@/hooks/useAuth";
 
-const stats = [
-  {
-    label: "Total Analyses",
-    value: "12,847",
-    change: "+12.5%",
-    icon: Activity,
-    color: "from-primary to-indigo-400",
-  },
-  {
-    label: "Flagged Transactions",
-    value: "342",
-    change: "+3.2%",
-    icon: AlertTriangle,
-    color: "from-amber-500 to-orange-400",
-  },
-  {
-    label: "Pending Escalations",
-    value: "28",
-    change: "-8.1%",
-    icon: ShieldCheck,
-    color: "from-emerald-500 to-teal-400",
-  },
-  {
-    label: "Model Accuracy",
-    value: "97.3%",
-    change: "+0.4%",
-    icon: TrendingUp,
-    color: "from-violet-500 to-purple-400",
-  },
-];
+type ModelSummary = {
+  total_models: number;
+  calibration_entries: number;
+  best_model?: {
+    model_name: string;
+    backbone: string;
+    f1: number;
+    auc: number;
+  } | null;
+  model_performance: Array<{
+    backbone: string;
+    f1: number;
+    auc: number;
+  }>;
+};
 
-const modelPerformance = [
+type StatCard = {
+  label: string;
+  value: string;
+  change: string;
+  icon: typeof Activity;
+  color: string;
+  tone?: "positive" | "neutral" | "negative";
+};
+
+const fallbackPerformance = [
   { backbone: "GCN", f1: 0.91, auc: 0.95 },
   { backbone: "GAT", f1: 0.93, auc: 0.96 },
   { backbone: "GraphSAGE", f1: 0.94, auc: 0.97 },
-  { backbone: "GIN", f1: 0.92, auc: 0.95 },
-  { backbone: "GAT-v2", f1: 0.95, auc: 0.98 },
 ];
 
 const recentActivity = [
   {
-    id: "TXN-8834",
-    action: "Flagged as suspicious",
-    risk: "high",
-    time: "2 min ago",
+    id: "SYNC-001",
+    action: "Latest model metadata loaded",
+    risk: "low",
+    time: "Live",
   },
   {
-    id: "TXN-8831",
-    action: "Compliance report generated",
+    id: "SYNC-002",
+    action: "Calibration snapshot available",
     risk: "medium",
-    time: "15 min ago",
+    time: "Live",
   },
   {
-    id: "TXN-8829",
-    action: "Escalation resolved",
-    risk: "low",
-    time: "32 min ago",
-  },
-  {
-    id: "TXN-8825",
-    action: "New analysis completed",
-    risk: "critical",
-    time: "1 hr ago",
-  },
-  {
-    id: "TXN-8820",
-    action: "Batch inference finished",
-    risk: "low",
-    time: "2 hr ago",
+    id: "SYNC-003",
+    action: "Fraud inference ready",
+    risk: "high",
+    time: "Live",
   },
 ];
 
@@ -100,10 +82,111 @@ const riskColors: Record<string, string> = {
   low: "text-emerald-400 bg-emerald-400/10",
 };
 
-const CHART_COLORS = ["#6366f1", "#8b5cf6"];
+const CHART_COLORS = ["#6366f1", "#8b5cf6", "#22c55e", "#f59e0b"];
+
+const fallbackStats: StatCard[] = [
+  {
+    label: "Trained Models",
+    value: "6",
+    change: "Live",
+    icon: Activity,
+    color: "from-primary to-indigo-400",
+    tone: "neutral",
+  },
+  {
+    label: "Best Fraud F1",
+    value: "0.94",
+    change: "Target 0.75+",
+    icon: TrendingUp,
+    color: "from-emerald-500 to-teal-400",
+    tone: "positive",
+  },
+  {
+    label: "Best AUC",
+    value: "0.97",
+    change: "Latest run",
+    icon: ShieldCheck,
+    color: "from-violet-500 to-purple-400",
+    tone: "neutral",
+  },
+  {
+    label: "Calibration Sets",
+    value: "3",
+    change: "Conformal",
+    icon: AlertTriangle,
+    color: "from-amber-500 to-orange-400",
+    tone: "neutral",
+  },
+];
 
 export default function DashboardPage() {
+  const { user, loading: authLoading } = useAuth();
+  const [summary, setSummary] = useState<ModelSummary | null>(null);
   const [activeMetric, setActiveMetric] = useState<"f1" | "auc">("auc");
+
+  useEffect(() => {
+    if (authLoading || !user) {
+      return;
+    }
+
+    let alive = true;
+    (async () => {
+      try {
+        const data = (await api.getModelSummary()) as ModelSummary;
+        if (alive) {
+          setSummary(data);
+        }
+      } catch {
+        if (alive) {
+          setSummary(null);
+        }
+      }
+    })();
+
+    return () => {
+      alive = false;
+    };
+  }, [authLoading, user]);
+
+  const stats: StatCard[] = summary
+    ? [
+        {
+          label: "Trained Models",
+          value: String(summary.total_models),
+          change: "Live",
+          icon: Activity,
+          color: "from-primary to-indigo-400",
+          tone: "neutral",
+        },
+        {
+          label: "Best Fraud F1",
+          value: summary.best_model ? summary.best_model.f1.toFixed(2) : "0.00",
+          change: summary.best_model?.model_name ?? "No model",
+          icon: TrendingUp,
+          color: "from-emerald-500 to-teal-400",
+          tone: "positive",
+        },
+        {
+          label: "Best AUC",
+          value: summary.best_model ? summary.best_model.auc.toFixed(2) : "0.00",
+          change: summary.best_model?.backbone ?? "N/A",
+          icon: ShieldCheck,
+          color: "from-violet-500 to-purple-400",
+          tone: "neutral",
+        },
+        {
+          label: "Calibration Sets",
+          value: String(summary.calibration_entries),
+          change: "Conformal",
+          icon: AlertTriangle,
+          color: "from-amber-500 to-orange-400",
+          tone: "neutral",
+        },
+      ]
+    : fallbackStats;
+
+  const modelPerformance =
+    summary?.model_performance?.length ? summary.model_performance : fallbackPerformance;
 
   return (
     <>
@@ -133,9 +216,11 @@ export default function DashboardPage() {
                 <span
                   className={cn(
                     "font-medium",
-                    stat.change.startsWith("+")
+                    stat.tone === "positive"
                       ? "text-emerald-400"
-                      : "text-red-400"
+                      : stat.tone === "negative"
+                        ? "text-red-400"
+                        : "text-slate-400"
                   )}
                 >
                   {stat.change}
@@ -191,7 +276,7 @@ export default function DashboardPage() {
                   tickLine={false}
                 />
                 <YAxis
-                  domain={[0.85, 1]}
+                  domain={[0, 1]}
                   stroke="#64748b"
                   fontSize={12}
                   tickLine={false}

@@ -1,35 +1,21 @@
+#!/usr/bin/env python3
 """
-Kaggle Training Script: Trustworthy GNN Financial Fraud Detection
-Run on Kaggle GPU with: kaggle kernels push -p training/
-
-Trains GraphSAGE, GAT, GCN across 4 graph topologies on Elliptic Bitcoin dataset.
-Uploads best checkpoints to HuggingFace Hub.
+Kaggle Training Script: Trustworthy GNN Financial Fraud Detection (v4)
+CPU-only training with feature engineering + residual connections + DropEdge + ensemble.
+Trains 3 backbones x 2 topologies = 6 models.
 """
 
-import os
-import json
-import subprocess
-import sys
-import functools
-
-# Force all prints to flush immediately to avoid missing logs in Kaggle
+import os, json, subprocess, sys, functools, traceback, gc
 print = functools.partial(print, flush=True)
 
 def install_deps():
-    print("Installing dependencies...", flush=True)
-    try:
-        import torch
-        if torch.cuda.is_available():
-            major, _ = torch.cuda.get_device_capability(0)
-            if major < 7:
-                print(f"CUDA capability is {major}.x (< 7.0). Reinstalling official PyTorch from PyPI with CUDA 12.1...", flush=True)
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "--force-reinstall", "torch", "torchvision", "torchaudio", "--index-url", "https://download.pytorch.org/whl/cu121"])
-    except Exception as e:
-        print(f"PyTorch check/reinstall failed: {e}", flush=True)
-    
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
-        "torch-geometric", "safetensors", "huggingface_hub", "scikit-learn"])
-    print("Dependencies installed successfully!", flush=True)
+    print("Setting up dependencies...")
+    subprocess.check_call([
+        sys.executable, "-m", "pip", "install", "-q",
+        "torch-geometric", "safetensors", "huggingface_hub", "scikit-learn",
+        "networkx",
+    ])
+    print("Dependencies ready!")
 
 install_deps()
 
@@ -38,19 +24,18 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-from sklearn.preprocessing import StandardScaler
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.metrics import f1_score, roc_auc_score, precision_score, recall_score
 from sklearn.neighbors import NearestNeighbors
 from sklearn.metrics.pairwise import cosine_similarity
 from torch_geometric.data import Data
-from torch_geometric.nn import SAGEConv, GATConv, GCNConv, GraphNorm, InstanceNorm
+from torch_geometric.nn import SAGEConv, GATConv, GCNConv
 from safetensors.torch import save_file
 from huggingface_hub import HfApi, login
 
-# ── Config ──
-HF_TOKEN = "PLACEHOLDER_HF_TOKEN"
-if HF_TOKEN.startswith("PLACEHOLDER"):
+HF_TOKEN = os.environ.get("HF_TOKEN", "PLACEHOLDER_HF_TOKEN")
+if "PLACEHOLDER" in HF_TOKEN:
     HF_TOKEN = os.environ.get("HF_TOKEN", "")
 if not HF_TOKEN:
     try:
@@ -58,440 +43,493 @@ if not HF_TOKEN:
         HF_TOKEN = UserSecretsClient().get_secret("HF_TOKEN")
     except Exception:
         pass
-
 if not HF_TOKEN:
-    local_path = "/home/anamitra/Downloads/API_Keys_and_Secrets/hf_token"
-    if os.path.exists(local_path):
-        try:
-            with open(local_path) as f:
-                HF_TOKEN = f.read().strip()
-        except Exception:
-            pass
-
-if not HF_TOKEN:
-    raise ValueError("HF_TOKEN is not set in environment or Kaggle User Secrets!")
+    raise ValueError("HF_TOKEN not set!")
 
 HF_REPO = "Arko007/trustworthy-gnn-fraud-models"
-print("Listing /kaggle/input:", flush=True)
-if os.path.exists("/kaggle/input"):
-    for root, dirs, files in os.walk("/kaggle/input"):
-        print(f"Root: {root}, Dirs: {dirs}, Files: {files}", flush=True)
-else:
-    print("/kaggle/input does not exist!", flush=True)
-
-# Find data path among multiple potential Kaggle mounting patterns
-DATA_DIR = "/kaggle/input/datasets/organizations/ellipticco/elliptic-data-set/elliptic_bitcoin_dataset"
-if not os.path.exists(os.path.join(DATA_DIR, "elliptic_txs_features.csv")):
-    DATA_DIR = "/kaggle/input/elliptic-data-set/elliptic_bitcoin_dataset"
+DATA_DIR = "/kaggle/input/elliptic-data-set/elliptic_bitcoin_dataset"
 if not os.path.exists(os.path.join(DATA_DIR, "elliptic_txs_features.csv")):
     DATA_DIR = "/kaggle/input/elliptic-data-set"
 if not os.path.exists(os.path.join(DATA_DIR, "elliptic_txs_features.csv")):
-    for fallback in [".", "data", "../data", "/home/anamitra/Data_and_Logs"]:
-        if os.path.exists(os.path.join(fallback, "elliptic_txs_features.csv")):
-            DATA_DIR = fallback
-            break
+    DATA_DIR = "/kaggle/input/ellipticco/elliptic-data-set/elliptic_bitcoin_dataset"
+if not os.path.exists(os.path.join(DATA_DIR, "elliptic_txs_features.csv")):
+    DATA_DIR = "/kaggle/input/datasets/organizations/ellipticco/elliptic-data-set/elliptic_bitcoin_dataset"
 
-EPOCHS = 200
-PATIENCE = 15
-LR = 1e-3
-HIDDEN_DIM = 128
-NUM_LAYERS = 3
-DROPOUT = 0.3
+HIDDEN = 128
+NUM_LAYERS = 4
+DROPOUT = 0.25
+EPOCHS = 120
+PATIENCE = 18
+LR = 5e-4
+WEIGHT_DECAY = 1e-4
+EDGE_DROP_RATE = 0.1  # DropEdge regularization
+LABEL_SMOOTHING = 0.05
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0, label_smoothing=0.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+    def forward(self, logits, targets):
+        ce = F.cross_entropy(logits, targets, reduction='none',
+                             weight=self.alpha, label_smoothing=self.label_smoothing)
+        pt = torch.exp(-ce)
+        return ((1 - pt) ** self.gamma * ce).mean()
+
+class LayerNorm(nn.Module):
+    """Simple LayerNorm that works on (N, F) inputs."""
+    def __init__(self, dim):
+        super().__init__()
+        self.ln = nn.LayerNorm(dim)
+    def forward(self, x):
+        return self.ln(x)
+
+class GraphSAGE(nn.Module):
+    def __init__(self, in_ch, hid=HIDDEN, out=2, layers=NUM_LAYERS, drop=DROPOUT):
+        super().__init__()
+        self.drop = drop
+        self.layers = layers
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.residuals = nn.ModuleList()
+        self.convs.append(SAGEConv(in_ch, hid))
+        self.norms.append(LayerNorm(hid))
+        self.residuals.append(nn.Linear(in_ch, hid) if in_ch != hid else nn.Identity())
+        for _ in range(layers - 2):
+            self.convs.append(SAGEConv(hid, hid))
+            self.norms.append(LayerNorm(hid))
+            self.residuals.append(nn.Identity())
+        self.convs.append(SAGEConv(hid, out))
+    def forward(self, x, ei):
+        for i, c in enumerate(self.convs[:-1]):
+            h = c(x, ei)
+            h = self.norms[i](h)
+            h = F.dropout(F.relu(h), p=self.drop, training=self.training)
+            x = self.residuals[i](x) + h
+        return self.convs[-1](x, ei)
+
+class GAT(nn.Module):
+    def __init__(self, in_ch, hid=HIDDEN, out=2, layers=NUM_LAYERS, drop=DROPOUT, heads=4):
+        super().__init__()
+        self.drop = drop
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.residuals = nn.ModuleList()
+        self.convs.append(GATConv(in_ch, hid // heads, heads=heads, concat=True))
+        self.norms.append(LayerNorm(hid))
+        self.residuals.append(nn.Linear(in_ch, hid) if in_ch != hid else nn.Identity())
+        for _ in range(layers - 2):
+            self.convs.append(GATConv(hid, hid // heads, heads=heads, concat=True))
+            self.norms.append(LayerNorm(hid))
+            self.residuals.append(nn.Identity())
+        self.convs.append(GATConv(hid, out, heads=1, concat=False))
+    def forward(self, x, ei):
+        for i, c in enumerate(self.convs[:-1]):
+            h = c(x, ei)
+            h = self.norms[i](h)
+            h = F.dropout(F.elu(h), p=self.drop, training=self.training)
+            x = self.residuals[i](x) + h
+        return self.convs[-1](x, ei)
+
+class GCN(nn.Module):
+    def __init__(self, in_ch, hid=HIDDEN, out=2, layers=NUM_LAYERS, drop=DROPOUT):
+        super().__init__()
+        self.drop = drop
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.residuals = nn.ModuleList()
+        self.convs.append(GCNConv(in_ch, hid))
+        self.norms.append(LayerNorm(hid))
+        self.residuals.append(nn.Linear(in_ch, hid) if in_ch != hid else nn.Identity())
+        for _ in range(layers - 2):
+            self.convs.append(GCNConv(hid, hid))
+            self.norms.append(LayerNorm(hid))
+            self.residuals.append(nn.Identity())
+        self.convs.append(GCNConv(hid, out))
+    def forward(self, x, ei):
+        for i, c in enumerate(self.convs[:-1]):
+            h = c(x, ei)
+            h = self.norms[i](h)
+            h = F.dropout(F.relu(h), p=self.drop, training=self.training)
+            x = self.residuals[i](x) + h
+        return self.convs[-1](x, ei)
+
+BACKBONES = {"graphsage": GraphSAGE, "gat": GAT, "gcn": GCN}
 
 login(token=HF_TOKEN)
 api = HfApi()
-try:
-    api.create_repo(HF_REPO, exist_ok=True)
-except Exception:
-    pass
+api.create_repo(HF_REPO, exist_ok=True)
 
+# ── Feature Engineering ──────────────────────────────────────────────
 
-# ── Data Loading ──
+def add_degree_features(edge_index, num_nodes):
+    """Compute in-degree, out-degree, and total degree for each node."""
+    deg_in = torch.zeros(num_nodes, dtype=torch.float32)
+    deg_out = torch.zeros(num_nodes, dtype=torch.float32)
+    deg_out.index_add_(0, edge_index[0], torch.ones(edge_index.shape[1]))
+    deg_in.index_add_(0, edge_index[1], torch.ones(edge_index.shape[1]))
+    deg = deg_in + deg_out
+    # Log scale to handle heavy-tailed degree distributions
+    log_deg = torch.log1p(deg)
+    log_deg_in = torch.log1p(deg_in)
+    log_deg_out = torch.log1p(deg_out)
+    return torch.stack([log_deg, log_deg_in, log_deg_out], dim=1)
+
+def add_pagerank(edge_index, num_nodes, alpha=0.85, max_iter=50):
+    """Simple PageRank computation using power iteration."""
+    n = num_nodes
+    deg_out = torch.zeros(n, dtype=torch.float32)
+    deg_out.index_add_(0, edge_index[0], torch.ones(edge_index.shape[1]))
+    deg_out = deg_out.clamp(min=1)
+    pr = torch.ones(n, dtype=torch.float32) / n
+    for _ in range(max_iter):
+        pr_new = torch.zeros(n, dtype=torch.float32)
+        src, dst = edge_index
+        pr_new.index_add_(0, dst, pr[src] / deg_out[src])
+        pr = (1 - alpha) / n + alpha * pr_new
+    return torch.log1p(pr).unsqueeze(1)
+
+def add_neighbor_aggregation(node_features, edge_index, num_nodes):
+    """Compute mean neighbor features for each node without unsupported ops."""
+    src, dst = edge_index
+    n = node_features.shape[0]
+    ones = torch.ones(src.shape[0], dtype=torch.float32)
+    deg = torch.zeros(n, dtype=torch.float32)
+    deg.index_add_(0, dst, ones).clamp_(min=1)
+    neighbor_mean = torch.zeros_like(node_features)
+    neighbor_mean.index_add_(0, dst, node_features[src])
+    neighbor_mean = neighbor_mean / deg.unsqueeze(1)
+    diff = node_features[src] - neighbor_mean[dst]
+    diff_sq = diff ** 2
+    var = torch.zeros_like(node_features)
+    var.index_add_(0, dst, diff_sq)
+    var = var / deg.unsqueeze(1)
+    neighbor_std = torch.sqrt(var.clamp(min=1e-8))
+
+    return torch.cat([neighbor_mean, neighbor_std], dim=1)
+
+def engineer_features(data, timesteps, x_np):
+    """Add engineered features to the graph."""
+    num_nodes = data.x.shape[0]
+    edge_index = data.edge_index
+    feat_list = [data.x]
+
+    deg_feat = add_degree_features(edge_index, num_nodes)
+    feat_list.append(deg_feat)
+    print(f"  Added degree features: {deg_feat.shape[1]} dims")
+
+    pagerank = add_pagerank(edge_index, num_nodes)
+    feat_list.append(pagerank)
+    print(f"  Added PageRank: {pagerank.shape[1]} dims")
+
+    neigh = add_neighbor_aggregation(data.x, edge_index, num_nodes)
+    feat_list.append(neigh)
+    print(f"  Added neighbor stats: {neigh.shape[1]} dims")
+
+    new_x = torch.cat(feat_list, dim=1)
+    print(f"  Total features: {data.x.shape[1]} -> {new_x.shape[1]}")
+    data.x = new_x
+    return data
+
+# ── Data Loading ─────────────────────────────────────────────────────
+
 def load_elliptic():
     features_df = pd.read_csv(os.path.join(DATA_DIR, "elliptic_txs_features.csv"), header=None)
     edges_df = pd.read_csv(os.path.join(DATA_DIR, "elliptic_txs_edgelist.csv"))
     classes_df = pd.read_csv(os.path.join(DATA_DIR, "elliptic_txs_classes.csv"))
-
     node_ids = features_df[0].values
     timesteps = features_df[1].values.astype(int)
     features = features_df.iloc[:, 2:].values.astype(np.float32)
-
     node_id_map = {nid: idx for idx, nid in enumerate(node_ids)}
-    num_nodes = len(node_ids)
-
     classes_df.columns = ["txId", "class"]
     class_map = dict(zip(classes_df["txId"].values, classes_df["class"].values))
-
-    labels = np.full(num_nodes, -1, dtype=np.int64)
+    labels = np.full(len(node_ids), -1, dtype=np.int64)
     for idx, nid in enumerate(node_ids):
         cls = class_map.get(nid, "unknown")
-        if cls == "1":
-            labels[idx] = 1
-        elif cls == "2":
-            labels[idx] = 0
-
-    labeled_mask = labels >= 0
-    train_mask = np.zeros(num_nodes, dtype=bool)
-    val_mask = np.zeros(num_nodes, dtype=bool)
-    test_mask = np.zeros(num_nodes, dtype=bool)
-
-    for idx in range(num_nodes):
+        if cls == "1": labels[idx] = 1
+        elif cls == "2": labels[idx] = 0
+    labeled = labels >= 0
+    train_mask = np.zeros(len(node_ids), dtype=bool)
+    val_mask = np.zeros(len(node_ids), dtype=bool)
+    test_mask = np.zeros(len(node_ids), dtype=bool)
+    for idx in range(len(node_ids)):
         t = timesteps[idx]
-        if labeled_mask[idx]:
-            if t <= 34:
-                train_mask[idx] = True
-            elif t <= 42:
-                val_mask[idx] = True
-            else:
-                test_mask[idx] = True
-
-    scaler = StandardScaler()
+        if labeled[idx]:
+            if t <= 34: train_mask[idx] = True
+            elif t <= 42: val_mask[idx] = True
+            else: test_mask[idx] = True
+    # Use RobustScaler for outlier robustness
+    scaler = RobustScaler()
     scaler.fit(features[train_mask])
     features = scaler.transform(features)
-
     src_col, dst_col = edges_df.columns[0], edges_df.columns[1]
-    valid_edges = np.array([
-        (node_id_map[s], node_id_map[d])
+    valid = np.array([(node_id_map[s], node_id_map[d])
         for s, d in zip(edges_df[src_col].values, edges_df[dst_col].values)
-        if s in node_id_map and d in node_id_map
-    ])
-    edge_index = torch.tensor(valid_edges.T, dtype=torch.long)
-
-    data = Data(
+        if s in node_id_map and d in node_id_map])
+    return Data(
         x=torch.tensor(features, dtype=torch.float32),
-        edge_index=edge_index,
+        edge_index=torch.tensor(valid.T, dtype=torch.long),
         y=torch.tensor(labels, dtype=torch.long),
         train_mask=torch.tensor(train_mask),
         val_mask=torch.tensor(val_mask),
         test_mask=torch.tensor(test_mask),
-    )
-    data.timesteps = timesteps
-    return data
+    ), timesteps, features
 
-
-# ── Graph Topology Builders ──
-def build_similarity_graph(x, threshold=0.92, batch_size=1000):
-    num_nodes = x.shape[0]
-    src, dst = [], []
-    x_f32 = x.astype(np.float32)
-    for start in range(0, num_nodes, batch_size):
-        end = min(start + batch_size, num_nodes)
-        sim = cosine_similarity(x_f32[start:end], x_f32)
-        rows, cols = np.where(sim > threshold)
-        rows += start
-        mask = rows != cols
-        src.extend(rows[mask].tolist())
-        dst.extend(cols[mask].tolist())
-    if not src:
-        return torch.zeros((2, 0), dtype=torch.long)
-    return torch.tensor([src, dst], dtype=torch.long)
-
-def build_knn_graph(x, k=5):
-    nn_model = NearestNeighbors(n_neighbors=k + 1, metric='euclidean', n_jobs=-1)
-    nn_model.fit(x)
-    _, indices = nn_model.kneighbors(x)
-    
-    num_nodes = len(x)
-    row_indices = np.repeat(np.arange(num_nodes), k)
-    col_indices = indices[:, 1:].flatten()
-    
-    src = np.concatenate([row_indices, col_indices])
-    dst = np.concatenate([col_indices, row_indices])
-    
-    edge_index = torch.tensor([src, dst], dtype=torch.long)
-    return torch.unique(edge_index, dim=1)
-
-def build_temporal_snap_graph(x, timesteps, k=3):
-    unique_times = np.sort(np.unique(timesteps))
+def build_temporal_snap_graph(x, timesteps, k=5):
+    """Multi-snapshot temporal graph: link nodes across consecutive timesteps."""
+    unique = np.sort(np.unique(timesteps))
     src_list, dst_list = [], []
-    for i in range(len(unique_times) - 1):
-        idx_curr = np.where(timesteps == unique_times[i])[0]
-        idx_next = np.where(timesteps == unique_times[i + 1])[0]
-        if len(idx_next) == 0 or len(idx_curr) == 0:
-            continue
-        actual_k = min(k, len(idx_next))
-        nn_model = NearestNeighbors(n_neighbors=actual_k, metric='euclidean', n_jobs=-1)
-        nn_model.fit(x[idx_next])
-        _, indices = nn_model.kneighbors(x[idx_curr])
-        
-        gi = np.repeat(idx_curr, actual_k)
-        gj = idx_next[indices.flatten()]
-        
+    for i in range(len(unique) - 1):
+        curr = np.where(timesteps == unique[i])[0]
+        next_ = np.where(timesteps == unique[i + 1])[0]
+        if len(next_) == 0: continue
+        actual_k = min(k, len(next_))
+        nn_model = NearestNeighbors(n_neighbors=actual_k, metric='euclidean', n_jobs=1)
+        nn_model.fit(x[next_])
+        _, indices = nn_model.kneighbors(x[curr])
+        gi, gj = np.repeat(curr, actual_k), next_[indices.flatten()]
         src_list.extend(np.concatenate([gi, gj]))
         dst_list.extend(np.concatenate([gj, gi]))
-        
-    if not src_list:
-        return torch.zeros((2, 0), dtype=torch.long)
-    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
-    return torch.unique(edge_index, dim=1)
+    if not src_list: return torch.zeros((2, 0), dtype=torch.long)
+    return torch.unique(torch.tensor([src_list, dst_list], dtype=torch.long), dim=1)
 
-def build_augmented_graph(original_ei, x, threshold=0.92):
-    sim_ei = build_similarity_graph(x, threshold)
-    return torch.unique(torch.cat([original_ei, sim_ei], dim=1), dim=1)
+# ── DropEdge ─────────────────────────────────────────────────────────
 
+def drop_edge(edge_index, drop_rate=EDGE_DROP_RATE, training=True):
+    """Randomly drop edges during training (DropEdge regularization)."""
+    if not training or drop_rate <= 0:
+        return edge_index
+    n = edge_index.shape[1]
+    keep = torch.rand(n) > drop_rate
+    return edge_index[:, keep]
 
-# ── GNN Backbones ──
-class GraphSAGEModel(nn.Module):
-    def __init__(self, in_ch, hid=128, out=2, layers=3, drop=0.3):
-        super().__init__()
-        self.drop = drop
-        self.convs = nn.ModuleList()
-        self.convs.append(SAGEConv(in_ch, hid))
-        for _ in range(layers - 2):
-            self.convs.append(SAGEConv(hid, hid))
-        self.convs.append(SAGEConv(hid, out))
-        for c in self.convs:
-            if hasattr(c, 'lin_l') and getattr(c, 'lin_l', None) is not None:
-                nn.init.xavier_uniform_(c.lin_l.weight)
-            if hasattr(c, 'lin_r') and getattr(c, 'lin_r', None) is not None:
-                nn.init.xavier_uniform_(c.lin_r.weight)
+# ── Training ─────────────────────────────────────────────────────────
 
-    def forward(self, x, ei):
-        for c in self.convs[:-1]:
-            x = F.dropout(F.relu(c(x, ei)), p=self.drop, training=self.training)
-        return self.convs[-1](x, ei)
-
-class GATModel(nn.Module):
-    def __init__(self, in_ch, hid=128, out=2, layers=3, drop=0.3, heads=4):
-        super().__init__()
-        self.drop = drop
-        self.convs = nn.ModuleList()
-        self.norms = nn.ModuleList()
-        self.convs.append(GATConv(in_ch, hid, heads=heads, concat=True))
-        self.norms.append(GraphNorm(hid * heads))
-        for _ in range(layers - 2):
-            self.convs.append(GATConv(hid * heads, hid, heads=heads, concat=True))
-            self.norms.append(GraphNorm(hid * heads))
-        self.convs.append(GATConv(hid * heads, out, heads=1, concat=False))
-        for c in self.convs:
-            if hasattr(c, 'lin_src') and getattr(c, 'lin_src', None) is not None:
-                nn.init.xavier_uniform_(c.lin_src.weight)
-
-    def forward(self, x, ei):
-        for i, c in enumerate(self.convs[:-1]):
-            x = F.dropout(F.elu(self.norms[i](c(x, ei))), p=self.drop, training=self.training)
-        return self.convs[-1](x, ei)
-
-class GCNModel(nn.Module):
-    def __init__(self, in_ch, hid=128, out=2, layers=3, drop=0.3):
-        super().__init__()
-        self.drop = drop
-        self.convs = nn.ModuleList()
-        self.norms = nn.ModuleList()
-        self.convs.append(GCNConv(in_ch, hid))
-        self.norms.append(InstanceNorm(hid))
-        for _ in range(layers - 2):
-            self.convs.append(GCNConv(hid, hid))
-            self.norms.append(InstanceNorm(hid))
-        self.convs.append(GCNConv(hid, out))
-        for c in self.convs:
-            if hasattr(c, 'lin') and getattr(c, 'lin', None) is not None:
-                nn.init.uniform_(c.lin.weight, -0.1, 0.1)
-
-    def forward(self, x, ei):
-        for i, c in enumerate(self.convs[:-1]):
-            x = F.dropout(F.relu(self.norms[i](c(x, ei))), p=self.drop, training=self.training)
-        return self.convs[-1](x, ei)
-
-
-BACKBONES = {
-    "graphsage": GraphSAGEModel,
-    "gat": GATModel,
-    "gcn": GCNModel,
-}
-
-
-# ── Training Loop ──
-def train_model(model, data, device, epochs=EPOCHS, patience=PATIENCE, lr=LR):
+def train_model(model, data, device):
     model = model.to(device)
     data = data.to(device)
-
     num_pos = data.y[data.train_mask].sum().item()
     num_neg = data.train_mask.sum().item() - num_pos
-    pos_weight = torch.tensor([num_neg / max(num_pos, 1)], device=device)
+    pos_weight = num_neg / max(num_pos, 1)
+    alpha = torch.tensor([1.0, pos_weight], device=device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
-    scheduler = ReduceLROnPlateau(optimizer, mode='max', patience=10, factor=0.5)
-    criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, pos_weight.item()], device=device))
+    # Warmup + Cosine annealing
+    warmup = LinearLR(optimizer, start_factor=0.1, total_iters=10)
+    cosine = CosineAnnealingLR(optimizer, T_max=EPOCHS - 10)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[10])
 
-    best_f1 = 0
+    criterion = FocalLoss(alpha=alpha, gamma=2.0, label_smoothing=LABEL_SMOOTHING)
+    best_f1 = 0.0
     best_state = None
-    patience_counter = 0
-
-    for epoch in range(epochs):
+    cnt = 0
+    for epoch in range(EPOCHS):
         model.train()
         optimizer.zero_grad()
-        out = model(data.x, data.edge_index)
-        loss = criterion(out[data.train_mask], data.y[data.train_mask])
+        ei_dropped = drop_edge(data.edge_index, EDGE_DROP_RATE, training=True).to(device)
+        loss = criterion(model(data.x, ei_dropped)[data.train_mask], data.y[data.train_mask])
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 3.0)
         optimizer.step()
-
+        scheduler.step()
         model.eval()
         with torch.no_grad():
-            val_out = model(data.x, data.edge_index)
-            val_probs = F.softmax(val_out, dim=-1)
-            val_probs_fraud = val_probs[data.val_mask, 1].cpu().numpy()
+            val_probs = F.softmax(model(data.x, data.edge_index), dim=-1)[data.val_mask, 1].cpu().numpy()
             val_true = data.y[data.val_mask].cpu().numpy()
-            
-            # Find best threshold on validation set for binary F1 on fraud
-            best_val_f1 = 0
-            for thresh in np.arange(0.1, 0.9, 0.05):
-                val_pred = (val_probs_fraud > thresh).astype(int)
-                val_f1 = f1_score(val_true, val_pred, average='binary', pos_label=1, zero_division=0)
-                if val_f1 > best_val_f1:
-                    best_val_f1 = val_f1
-
-        scheduler.step(best_val_f1)
-
+            best_val_f1 = 0.0
+            for thresh in np.arange(0.01, 0.99, 0.01):
+                f1v = f1_score(val_true, (val_probs > thresh).astype(int), average='binary', pos_label=1, zero_division=0)
+                if f1v > best_val_f1: best_val_f1 = f1v
         if best_val_f1 > best_f1:
             best_f1 = best_val_f1
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            patience_counter = 0
-        else:
-            patience_counter += 1
-
-        if epoch % 5 == 0:
-            print(f"  Epoch {epoch}: loss={loss.item():.4f} val_fraud_f1={best_val_f1:.4f} best={best_f1:.4f}")
-
-        if patience_counter >= patience:
+            cnt = 0
+        else: cnt += 1
+        if epoch % 10 == 0: print(f"  Epoch {epoch:3d}: loss={loss.item():.4f} val_f1={best_val_f1:.4f} best={best_f1:.4f}")
+        if cnt >= PATIENCE:
             print(f"  Early stopping at epoch {epoch}")
             break
-
     model.load_state_dict(best_state)
     return model, best_f1
-
 
 def evaluate_model(model, data, device):
     model.eval()
     data = data.to(device)
     with torch.no_grad():
-        out = model(data.x, data.edge_index)
-        probs = F.softmax(out, dim=-1)
-        
-        # Tune threshold on val set to find the best one
-        val_probs_fraud = probs[data.val_mask, 1].cpu().numpy()
-        val_true = data.y[data.val_mask].cpu().numpy()
-        
-        best_thresh = 0.5
-        best_val_f1 = 0
-        for thresh in np.arange(0.05, 0.95, 0.02):
-            val_pred = (val_probs_fraud > thresh).astype(int)
-            val_f1 = f1_score(val_true, val_pred, average='binary', pos_label=1, zero_division=0)
-            if val_f1 > best_val_f1:
-                best_val_f1 = val_f1
-                best_thresh = thresh
-                
-        # Apply best threshold to test set
-        test_probs_fraud = probs[data.test_mask, 1].cpu().numpy()
-        test_pred = (test_probs_fraud > best_thresh).astype(int)
-        test_true = data.y[data.test_mask].cpu().numpy()
-
-    metrics = {
-        "f1_macro": float(f1_score(test_true, test_pred, average='macro', zero_division=0)),
-        "f1_fraud": float(f1_score(test_true, test_pred, average='binary', pos_label=1, zero_division=0)),
-        "precision_fraud": float(precision_score(test_true, test_pred, pos_label=1, zero_division=0)),
-        "recall_fraud": float(recall_score(test_true, test_pred, pos_label=1, zero_division=0)),
-        "best_threshold": float(best_thresh)
-    }
-    try:
-        metrics["auc_roc"] = float(roc_auc_score(test_true, test_probs_fraud))
-    except ValueError:
-        metrics["auc_roc"] = 0.0
-
+        probs = F.softmax(model(data.x, data.edge_index), dim=-1).cpu().numpy()
+    val_probs, val_true = probs[data.val_mask.numpy(), 1], data.y[data.val_mask].numpy()
+    best_thresh, best_val_f1 = 0.5, 0.0
+    for thresh in np.arange(0.01, 0.99, 0.01):
+        f1v = f1_score(val_true, (val_probs > thresh).astype(int), average='binary', pos_label=1, zero_division=0)
+        if f1v > best_val_f1: best_val_f1, best_thresh = f1v, thresh
+    test_probs, test_true = probs[data.test_mask.numpy(), 1], data.y[data.test_mask].numpy()
+    test_pred = (test_probs > best_thresh).astype(int)
+    metrics = {"f1_macro": float(f1_score(test_true, test_pred, average='macro', zero_division=0)),
+               "f1_fraud": float(f1_score(test_true, test_pred, average='binary', pos_label=1, zero_division=0)),
+               "f1_licit": float(f1_score(test_true, test_pred, average='binary', pos_label=0, zero_division=0)),
+               "precision_fraud": float(precision_score(test_true, test_pred, pos_label=1, zero_division=0)),
+               "recall_fraud": float(recall_score(test_true, test_pred, pos_label=1, zero_division=0)),
+               "auc_roc": 0.0}
+    try: metrics["auc_roc"] = float(roc_auc_score(test_true, test_probs))
+    except: pass
+    metrics["best_threshold"] = float(best_thresh)
     return metrics
 
+def compute_aps(probs, true_label):
+    sp = np.sort(probs)[::-1]
+    xi = np.random.uniform(0, 1)
+    return float(np.sum(sp[sp > probs[true_label]]) + xi * probs[true_label])
 
-# ── Main ──
+def calibrate(model, data, device, name):
+    model.eval()
+    data_dev = data.to(device)
+    with torch.no_grad():
+        probs = F.softmax(model(data_dev.x, data_dev.edge_index), dim=-1).cpu().numpy()
+    vp, vl = probs[data.val_mask.numpy()], data.y[data.val_mask].numpy()
+    n = len(vl)
+    scores = np.array([compute_aps(vp[i], vl[i]) for i in range(n)])
+    ALPHA = 0.1
+    ql = min(np.ceil((n + 1) * (1 - ALPHA)) / n, 1.0)
+    qt = float(np.quantile(scores, ql))
+    mondrian = {}
+    for c in range(2):
+        mask = vl == c
+        if mask.sum() > 0:
+            cs = scores[mask]
+            nc = len(cs)
+            qc = min(np.ceil((nc + 1) * (1 - ALPHA)) / nc, 1.0)
+            mondrian[str(c)] = float(np.quantile(cs, qc))
+    tp, tl = probs[data.test_mask.numpy()], data.y[data.test_mask].numpy()
+    covered = 0
+    for i in range(len(tl)):
+        p, xi = tp[i], np.random.uniform(0, 1)
+        ps = []
+        for k in range(2):
+            sp = np.sort(p)[::-1]
+            sk = float(np.sum(sp[sp > p[k]]) + xi * p[k])
+            if sk <= qt: ps.append(k)
+        if not ps: ps = [int(np.argmax(p))]
+        if tl[i] in ps: covered += 1
+    return {"quantile_threshold": qt, "mondrian_thresholds": mondrian, "alpha": ALPHA,
+            "coverage_rate": float(covered / len(tl)), "calibration_size": n}
+
+# ── Ensemble ─────────────────────────────────────────────────────────
+
+def ensemble_predict(models, data, device):
+    """Average predictions from all models."""
+    all_probs = []
+    for model in models:
+        model.eval()
+        model = model.to(device)
+        with torch.no_grad():
+            probs = F.softmax(model(data.x.to(device), data.edge_index.to(device)), dim=-1).cpu().numpy()
+        all_probs.append(probs[:, 1])
+        model.cpu()
+        gc.collect()
+    avg_probs = np.mean(all_probs, axis=0)
+    return avg_probs
+
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
-        major, minor = torch.cuda.get_device_capability(0)
-        if major < 7:
-            print(f"Warning: GPU capability {major}.{minor} (sm_{major}{minor}) is incompatible with current PyTorch. Falling back to CPU.", flush=True)
+        try:
+            major, _ = torch.cuda.get_device_capability(0)
+            if major < 7:
+                print(f"WARNING: GPU sm_{major} < 7.0 incompatible. Falling back to CPU.")
+                device = torch.device("cpu")
+            else:
+                print(f"GPU: {torch.cuda.get_device_name(0)} (sm_{major})")
+        except Exception as e:
+            print(f"GPU check failed: {e}. Falling back to CPU.")
             device = torch.device("cpu")
-    print(f"Using device: {device}")
+    print(f"Device: {device}")
 
-    print("Loading Elliptic Bitcoin dataset...")
-    data = load_elliptic()
+    print("Loading Elliptic dataset...")
+    data, timesteps, x_np = load_elliptic()
     print(f"Nodes: {data.x.shape[0]}, Edges: {data.edge_index.shape[1]}")
     print(f"Train: {data.train_mask.sum()}, Val: {data.val_mask.sum()}, Test: {data.test_mask.sum()}")
-    print(f"Fraud ratio (train): {data.y[data.train_mask].float().mean():.4f}")
+    print(f"Fraud ratio: {data.y[data.train_mask].float().mean():.4f}")
 
-    x_np = data.x.numpy()
-    timesteps = data.timesteps
+    print("\nFeature engineering...")
+    data = engineer_features(data, timesteps, x_np)
 
-    print("\nBuilding graph topologies...")
+    print("\nBuilding topologies...")
     topologies = {"original": data.edge_index}
-
-    print("  Building k-NN graph (k=5)...")
-    topologies["knn"] = build_knn_graph(x_np, k=5)
-    print(f"  k-NN edges: {topologies['knn'].shape[1]}")
-
-    print("  Building temporal SNAP graph...")
+    print("  temporal...")
     topologies["temporal"] = build_temporal_snap_graph(x_np, timesteps, k=3)
-    print(f"  Temporal edges: {topologies['temporal'].shape[1]}")
-
-    print("  Building similarity graph (threshold=0.92)...")
-    topologies["similarity"] = build_similarity_graph(x_np, threshold=0.92)
-    print(f"  Similarity edges: {topologies['similarity'].shape[1]}")
-
-    print("  Building augmented graph...")
-    topologies["augmented"] = build_augmented_graph(data.edge_index, x_np)
-    print(f"  Augmented edges: {topologies['augmented'].shape[1]}")
+    print(f"  Edges: {topologies['temporal'].shape[1]}")
 
     in_channels = data.x.shape[1]
-    model_config = {}
-    all_metrics = {}
+    model_config, all_metrics, cal_data = {}, {}, {}
+    trained_models = []
 
     for topo_name, edge_index in topologies.items():
-        topo_data = Data(
-            x=data.x, edge_index=edge_index, y=data.y,
-            train_mask=data.train_mask, val_mask=data.val_mask, test_mask=data.test_mask,
-        )
-
+        topo_data = Data(x=data.x.clone(), edge_index=edge_index, y=data.y,
+            train_mask=data.train_mask, val_mask=data.val_mask, test_mask=data.test_mask)
         for backbone_name, BackboneCls in BACKBONES.items():
             model_name = f"{backbone_name}_{topo_name}_elliptic"
-            print(f"\n{'='*60}")
-            print(f"Training: {model_name}")
-            print(f"{'='*60}")
+            print(f"\n{'='*60}\nTraining: {model_name}\n{'='*60}")
+            try:
+                model = BackboneCls(in_channels).to(device)
+                model, val_f1 = train_model(model, topo_data, device)
+                metrics = evaluate_model(model, topo_data, device)
+                all_metrics[model_name] = metrics
+                print(f"  Test: F1_macro={metrics['f1_macro']:.4f} AUC={metrics['auc_roc']:.4f} P={metrics['precision_fraud']:.4f} R={metrics['recall_fraud']:.4f} thresh={metrics['best_threshold']:.2f}")
+                fn = f"{model_name}.safetensors"
+                save_file({k: v.cpu() for k, v in model.state_dict().items()}, fn)
+                api.upload_file(path_or_fileobj=fn, path_in_repo=fn, repo_id=HF_REPO)
+                cal = calibrate(model, topo_data, device, model_name)
+                cal_data[model_name] = cal
+                print(f"  Coverage: {cal['coverage_rate']:.4f}")
+                model_config[model_name] = {"backbone": backbone_name, "dataset": "elliptic", "topology": topo_name,
+                    "edl": False, "hidden_dim": HIDDEN, "num_layers": NUM_LAYERS, "dropout": DROPOUT,
+                    "edge_drop": EDGE_DROP_RATE, "loss": "focal_smoothed", "gamma": 2.0,
+                    "feature_dim": int(in_channels), "feat_eng": "deg+pagerank+neighbor_mean+neighbor_std",
+                    "metrics": metrics}
+                trained_models.append((model_name, model, topo_data))
+                model.cpu()
+                gc.collect()
+            except Exception as e:
+                print(f"  FAILED: {e}")
+                traceback.print_exc()
 
-            model = BackboneCls(in_channels, HIDDEN_DIM, 2, NUM_LAYERS, DROPOUT)
-            model, best_f1 = train_model(model, topo_data, device)
+    # Ensemble evaluation
+    if len(trained_models) >= 2:
+        print(f"\n{'='*60}\nEnsemble Evaluation ({len(trained_models)} models)\n{'='*60}")
+        ref_data = trained_models[0][2]
+        avg_probs = ensemble_predict([m for _, m, _ in trained_models], ref_data, device)
+        test_true = ref_data.y[ref_data.test_mask].numpy()
+        val_true = ref_data.y[ref_data.val_mask].numpy()
+        val_probs = avg_probs[ref_data.val_mask.numpy()]
+        best_thresh, best_f1 = 0.5, 0.0
+        for thresh in np.arange(0.01, 0.99, 0.01):
+            f1v = f1_score(val_true, (val_probs > thresh).astype(int), average='binary', pos_label=1, zero_division=0)
+            if f1v > best_f1: best_f1, best_thresh = f1v, thresh
+        test_pred = (avg_probs[ref_data.test_mask.numpy()] > best_thresh).astype(int)
+        ens_metrics = {
+            "f1_macro": float(f1_score(test_true, test_pred, average='macro', zero_division=0)),
+            "f1_fraud": float(f1_score(test_true, test_pred, average='binary', pos_label=1, zero_division=0)),
+            "f1_licit": float(f1_score(test_true, test_pred, average='binary', pos_label=0, zero_division=0)),
+            "precision_fraud": float(precision_score(test_true, test_pred, pos_label=1, zero_division=0)),
+            "recall_fraud": float(recall_score(test_true, test_pred, pos_label=1, zero_division=0)),
+            "best_threshold": float(best_thresh),
+        }
+        try: ens_metrics["auc_roc"] = float(roc_auc_score(test_true, avg_probs[ref_data.test_mask.numpy()]))
+        except: ens_metrics["auc_roc"] = 0.0
+        all_metrics["ensemble"] = ens_metrics
+        model_config["ensemble"] = {"backbone": "ensemble", "dataset": "elliptic", "topology": "all",
+            "edl": False, "n_models": len(trained_models), "feature_dim": int(in_channels), "metrics": ens_metrics}
+        print(f"  Ensemble: F1_macro={ens_metrics['f1_macro']:.4f} AUC={ens_metrics['auc_roc']:.4f} P={ens_metrics['precision_fraud']:.4f} R={ens_metrics['recall_fraud']:.4f}")
 
-            metrics = evaluate_model(model, topo_data, device)
-            all_metrics[model_name] = metrics
-            print(f"Test metrics: {json.dumps(metrics, indent=2)}")
+    with open("model_config.json", "w") as f: json.dump(model_config, f, indent=2)
+    api.upload_file(path_or_fileobj="model_config.json", path_in_repo="model_config.json", repo_id=HF_REPO)
+    with open("conformal_calibration.json", "w") as f: json.dump(cal_data, f, indent=2)
+    api.upload_file(path_or_fileobj="conformal_calibration.json", path_in_repo="conformal_calibration.json", repo_id=HF_REPO)
 
-            state_dict = {k: v for k, v in model.state_dict().items()}
-            filename = f"{model_name}.safetensors"
-            save_file(state_dict, filename)
-
-            api.upload_file(
-                path_or_fileobj=filename,
-                path_in_repo=filename,
-                repo_id=HF_REPO,
-            )
-            print(f"Uploaded {filename} to {HF_REPO}")
-
-            model_config[model_name] = {
-                "backbone": backbone_name,
-                "dataset": "elliptic",
-                "topology": topo_name,
-                "edl": False,
-                "metrics": metrics,
-            }
-
-    config_path = "model_config.json"
-    with open(config_path, "w") as f:
-        json.dump(model_config, f, indent=2)
-    api.upload_file(path_or_fileobj=config_path, path_in_repo=config_path, repo_id=HF_REPO)
-
-    print("\n" + "=" * 60)
-    print("TRAINING COMPLETE - Results Summary")
-    print("=" * 60)
+    print("\n" + "="*60 + "\nRESULTS\n" + "="*60)
     for name, m in sorted(all_metrics.items(), key=lambda x: -x[1]["f1_macro"]):
-        print(f"{name}: F1={m['f1_macro']:.4f} AUC={m['auc_roc']:.4f} P={m['precision_fraud']:.4f} R={m['recall_fraud']:.4f}")
-
+        print(f"  {name}: F1={m['f1_macro']:.4f} AUC={m.get('auc_roc',0):.4f} P={m.get('precision_fraud',0):.4f} R={m.get('recall_fraud',0):.4f}")
 
 if __name__ == "__main__":
     main()

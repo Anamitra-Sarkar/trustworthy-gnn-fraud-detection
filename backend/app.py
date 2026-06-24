@@ -61,11 +61,13 @@ app.add_middleware(
 
 from routes.health import router as health_router
 from routes.inference import router as inference_router
+from routes.models import router as models_router
 from routes.uncertainty import router as uncertainty_router
 from routes.compliance import router as compliance_router
 
 app.include_router(health_router)
 app.include_router(inference_router)
+app.include_router(models_router)
 app.include_router(uncertainty_router)
 app.include_router(compliance_router)
 

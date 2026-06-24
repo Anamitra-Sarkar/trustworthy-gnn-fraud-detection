@@ -55,6 +55,26 @@ const mockResults: InferenceResult[] = Array.from({ length: 20 }, (_, i) => {
 
 type SortKey = "node_id" | "prediction" | "probability" | "risk_score";
 
+function SortHeader({
+  label,
+  field,
+  onSort,
+}: {
+  label: string;
+  field: SortKey;
+  onSort: (key: SortKey) => void;
+}) {
+  return (
+    <button
+      onClick={() => onSort(field)}
+      className="inline-flex items-center gap-1 text-xs font-medium uppercase tracking-wider text-muted-foreground hover:text-foreground"
+    >
+      {label}
+      <ArrowUpDown className="h-3 w-3" />
+    </button>
+  );
+}
+
 export default function AnalysisPage() {
   const [mode, setMode] = useState<"demo" | "upload">("demo");
   const [expandedRow, setExpandedRow] = useState<string | null>(null);
@@ -84,22 +104,6 @@ export default function AnalysisPage() {
         : (bVal as number) - (aVal as number);
     });
   }, [sortKey, sortDir]);
-
-  const SortHeader = ({
-    label,
-    field,
-  }: {
-    label: string;
-    field: SortKey;
-  }) => (
-    <button
-      onClick={() => handleSort(field)}
-      className="inline-flex items-center gap-1 text-xs font-medium uppercase tracking-wider text-muted-foreground hover:text-foreground"
-    >
-      {label}
-      <ArrowUpDown className="h-3 w-3" />
-    </button>
-  );
 
   return (
     <>
@@ -157,16 +161,16 @@ export default function AnalysisPage() {
               <thead>
                 <tr className="border-b border-border">
                   <th className="px-4 py-3 text-left">
-                    <SortHeader label="Node ID" field="node_id" />
+                    <SortHeader label="Node ID" field="node_id" onSort={handleSort} />
                   </th>
                   <th className="px-4 py-3 text-left">
-                    <SortHeader label="Prediction" field="prediction" />
+                    <SortHeader label="Prediction" field="prediction" onSort={handleSort} />
                   </th>
                   <th className="px-4 py-3 text-left">
-                    <SortHeader label="Confidence" field="probability" />
+                    <SortHeader label="Confidence" field="probability" onSort={handleSort} />
                   </th>
                   <th className="px-4 py-3 text-left">
-                    <SortHeader label="Risk Score" field="risk_score" />
+                    <SortHeader label="Risk Score" field="risk_score" onSort={handleSort} />
                   </th>
                   <th className="px-4 py-3 text-left">
                     <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
