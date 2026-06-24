@@ -15,7 +15,7 @@ from models.loader import ModelLoader
 from uncertainty.conformal import ConformalPredictor
 from uncertainty.evidential import EvidentialAnalyzer
 from uncertainty.mc_dropout import MCDropoutAnalyzer
-from config import CORS_ORIGINS, CONFORMAL_ALPHA, MC_DROPOUT_T
+from config import CORS_ORIGINS, CORS_ORIGIN_REGEX, CONFORMAL_ALPHA, MC_DROPOUT_T
 
 model_loader = ModelLoader()
 conformal_predictor = ConformalPredictor(alpha=CONFORMAL_ALPHA)
@@ -53,6 +53,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
+    allow_origin_regex=CORS_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

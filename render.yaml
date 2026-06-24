@@ -16,5 +16,5 @@ services:
         value: "0.1"
       - key: MC_DROPOUT_T
         value: "50"
-    healthCheckPath: /api/health
+    healthCheckPath: /
     autoDeploy: true

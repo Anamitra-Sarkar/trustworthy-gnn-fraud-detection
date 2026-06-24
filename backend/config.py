@@ -12,7 +12,13 @@ MODEL_CACHE_DIR = os.getenv("MODEL_DIR", "/model")
 
 FIREBASE_KEY_JSON = os.getenv("FIREBASE_KEY_JSON", "")
 
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:3000,https://*.vercel.app").split(",")
+_cors_raw = os.getenv("CORS_ORIGINS", "http://localhost:3000,https://*.vercel.app")
+CORS_ORIGINS = [o for o in _cors_raw.split(",") if "*" not in o]
+CORS_ORIGIN_REGEX = "|".join(
+    o.strip().replace(".", "\\.").replace("*", ".*") + "$"
+    for o in _cors_raw.split(",")
+    if "*" in o
+) or None
 
 CONFORMAL_ALPHA = float(os.getenv("CONFORMAL_ALPHA", "0.1"))
 MC_DROPOUT_T = int(os.getenv("MC_DROPOUT_T", "50"))

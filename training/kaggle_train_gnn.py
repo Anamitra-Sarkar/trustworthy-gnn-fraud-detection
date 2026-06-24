@@ -10,11 +10,26 @@ import os
 import json
 import subprocess
 import sys
+import functools
+
+# Force all prints to flush immediately to avoid missing logs in Kaggle
+print = functools.partial(print, flush=True)
 
 def install_deps():
+    print("Installing dependencies...", flush=True)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            major, _ = torch.cuda.get_device_capability(0)
+            if major < 7:
+                print(f"CUDA capability is {major}.x (< 7.0). Reinstalling official PyTorch from PyPI with CUDA 12.1...", flush=True)
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "--force-reinstall", "torch", "torchvision", "torchaudio", "--index-url", "https://download.pytorch.org/whl/cu121"])
+    except Exception as e:
+        print(f"PyTorch check/reinstall failed: {e}", flush=True)
+    
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
-        "torch-geometric", "torch-scatter", "torch-sparse",
-        "safetensors", "huggingface_hub", "scikit-learn"])
+        "torch-geometric", "safetensors", "huggingface_hub", "scikit-learn"])
+    print("Dependencies installed successfully!", flush=True)
 
 install_deps()
 
@@ -35,7 +50,7 @@ from huggingface_hub import HfApi, login
 
 # ── Config ──
 HF_TOKEN = "PLACEHOLDER_HF_TOKEN"
-if HF_TOKEN == "PLACEHOLDER_HF_TOKEN":
+if HF_TOKEN.startswith("PLACEHOLDER"):
     HF_TOKEN = os.environ.get("HF_TOKEN", "")
 if not HF_TOKEN:
     try:
@@ -57,7 +72,17 @@ if not HF_TOKEN:
     raise ValueError("HF_TOKEN is not set in environment or Kaggle User Secrets!")
 
 HF_REPO = "Arko007/trustworthy-gnn-fraud-models"
-DATA_DIR = "/kaggle/input/elliptic-data-set/elliptic_bitcoin_dataset"
+print("Listing /kaggle/input:", flush=True)
+if os.path.exists("/kaggle/input"):
+    for root, dirs, files in os.walk("/kaggle/input"):
+        print(f"Root: {root}, Dirs: {dirs}, Files: {files}", flush=True)
+else:
+    print("/kaggle/input does not exist!", flush=True)
+
+# Find data path among multiple potential Kaggle mounting patterns
+DATA_DIR = "/kaggle/input/datasets/organizations/ellipticco/elliptic-data-set/elliptic_bitcoin_dataset"
+if not os.path.exists(os.path.join(DATA_DIR, "elliptic_txs_features.csv")):
+    DATA_DIR = "/kaggle/input/elliptic-data-set/elliptic_bitcoin_dataset"
 if not os.path.exists(os.path.join(DATA_DIR, "elliptic_txs_features.csv")):
     DATA_DIR = "/kaggle/input/elliptic-data-set"
 if not os.path.exists(os.path.join(DATA_DIR, "elliptic_txs_features.csv")):
@@ -216,8 +241,10 @@ class GraphSAGEModel(nn.Module):
             self.convs.append(SAGEConv(hid, hid))
         self.convs.append(SAGEConv(hid, out))
         for c in self.convs:
-            if hasattr(c, 'lin_l'): nn.init.xavier_uniform_(c.lin_l.weight)
-            if hasattr(c, 'lin_r'): nn.init.xavier_uniform_(c.lin_r.weight)
+            if hasattr(c, 'lin_l') and getattr(c, 'lin_l', None) is not None:
+                nn.init.xavier_uniform_(c.lin_l.weight)
+            if hasattr(c, 'lin_r') and getattr(c, 'lin_r', None) is not None:
+                nn.init.xavier_uniform_(c.lin_r.weight)
 
     def forward(self, x, ei):
         for c in self.convs[:-1]:
@@ -237,7 +264,8 @@ class GATModel(nn.Module):
             self.norms.append(GraphNorm(hid * heads))
         self.convs.append(GATConv(hid * heads, out, heads=1, concat=False))
         for c in self.convs:
-            if hasattr(c, 'lin_src'): nn.init.xavier_uniform_(c.lin_src.weight)
+            if hasattr(c, 'lin_src') and getattr(c, 'lin_src', None) is not None:
+                nn.init.xavier_uniform_(c.lin_src.weight)
 
     def forward(self, x, ei):
         for i, c in enumerate(self.convs[:-1]):
@@ -257,7 +285,8 @@ class GCNModel(nn.Module):
             self.norms.append(InstanceNorm(hid))
         self.convs.append(GCNConv(hid, out))
         for c in self.convs:
-            if hasattr(c, 'lin'): nn.init.uniform_(c.lin.weight, -0.1, 0.1)
+            if hasattr(c, 'lin') and getattr(c, 'lin', None) is not None:
+                nn.init.uniform_(c.lin.weight, -0.1, 0.1)
 
     def forward(self, x, ei):
         for i, c in enumerate(self.convs[:-1]):
@@ -282,7 +311,7 @@ def train_model(model, data, device, epochs=EPOCHS, patience=PATIENCE, lr=LR):
     pos_weight = torch.tensor([num_neg / max(num_pos, 1)], device=device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
-    scheduler = ReduceLROnPlateau(optimizer, mode='max', patience=7, factor=0.5)
+    scheduler = ReduceLROnPlateau(optimizer, mode='max', patience=10, factor=0.5)
     criterion = nn.CrossEntropyLoss(weight=torch.tensor([1.0, pos_weight.item()], device=device))
 
     best_f1 = 0
@@ -300,21 +329,29 @@ def train_model(model, data, device, epochs=EPOCHS, patience=PATIENCE, lr=LR):
         model.eval()
         with torch.no_grad():
             val_out = model(data.x, data.edge_index)
-            val_pred = val_out[data.val_mask].argmax(dim=1).cpu().numpy()
+            val_probs = F.softmax(val_out, dim=-1)
+            val_probs_fraud = val_probs[data.val_mask, 1].cpu().numpy()
             val_true = data.y[data.val_mask].cpu().numpy()
-            val_f1 = f1_score(val_true, val_pred, average='macro', zero_division=0)
+            
+            # Find best threshold on validation set for binary F1 on fraud
+            best_val_f1 = 0
+            for thresh in np.arange(0.1, 0.9, 0.05):
+                val_pred = (val_probs_fraud > thresh).astype(int)
+                val_f1 = f1_score(val_true, val_pred, average='binary', pos_label=1, zero_division=0)
+                if val_f1 > best_val_f1:
+                    best_val_f1 = val_f1
 
-        scheduler.step(val_f1)
+        scheduler.step(best_val_f1)
 
-        if val_f1 > best_f1:
-            best_f1 = val_f1
+        if best_val_f1 > best_f1:
+            best_f1 = best_val_f1
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             patience_counter = 0
         else:
             patience_counter += 1
 
-        if epoch % 20 == 0:
-            print(f"  Epoch {epoch}: loss={loss.item():.4f} val_f1={val_f1:.4f} best={best_f1:.4f}")
+        if epoch % 5 == 0:
+            print(f"  Epoch {epoch}: loss={loss.item():.4f} val_fraud_f1={best_val_f1:.4f} best={best_f1:.4f}")
 
         if patience_counter >= patience:
             print(f"  Early stopping at epoch {epoch}")
@@ -330,18 +367,34 @@ def evaluate_model(model, data, device):
     with torch.no_grad():
         out = model(data.x, data.edge_index)
         probs = F.softmax(out, dim=-1)
-        pred = probs[data.test_mask].argmax(dim=1).cpu().numpy()
-        true = data.y[data.test_mask].cpu().numpy()
-        prob_np = probs[data.test_mask].cpu().numpy()
+        
+        # Tune threshold on val set to find the best one
+        val_probs_fraud = probs[data.val_mask, 1].cpu().numpy()
+        val_true = data.y[data.val_mask].cpu().numpy()
+        
+        best_thresh = 0.5
+        best_val_f1 = 0
+        for thresh in np.arange(0.05, 0.95, 0.02):
+            val_pred = (val_probs_fraud > thresh).astype(int)
+            val_f1 = f1_score(val_true, val_pred, average='binary', pos_label=1, zero_division=0)
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
+                best_thresh = thresh
+                
+        # Apply best threshold to test set
+        test_probs_fraud = probs[data.test_mask, 1].cpu().numpy()
+        test_pred = (test_probs_fraud > best_thresh).astype(int)
+        test_true = data.y[data.test_mask].cpu().numpy()
 
     metrics = {
-        "f1_macro": float(f1_score(true, pred, average='macro', zero_division=0)),
-        "f1_fraud": float(f1_score(true, pred, average='binary', pos_label=1, zero_division=0)),
-        "precision_fraud": float(precision_score(true, pred, pos_label=1, zero_division=0)),
-        "recall_fraud": float(recall_score(true, pred, pos_label=1, zero_division=0)),
+        "f1_macro": float(f1_score(test_true, test_pred, average='macro', zero_division=0)),
+        "f1_fraud": float(f1_score(test_true, test_pred, average='binary', pos_label=1, zero_division=0)),
+        "precision_fraud": float(precision_score(test_true, test_pred, pos_label=1, zero_division=0)),
+        "recall_fraud": float(recall_score(test_true, test_pred, pos_label=1, zero_division=0)),
+        "best_threshold": float(best_thresh)
     }
     try:
-        metrics["auc_roc"] = float(roc_auc_score(true, prob_np[:, 1]))
+        metrics["auc_roc"] = float(roc_auc_score(test_true, test_probs_fraud))
     except ValueError:
         metrics["auc_roc"] = 0.0
 
@@ -351,6 +404,11 @@ def evaluate_model(model, data, device):
 # ── Main ──
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        major, minor = torch.cuda.get_device_capability(0)
+        if major < 7:
+            print(f"Warning: GPU capability {major}.{minor} (sm_{major}{minor}) is incompatible with current PyTorch. Falling back to CPU.", flush=True)
+            device = torch.device("cpu")
     print(f"Using device: {device}")
 
     print("Loading Elliptic Bitcoin dataset...")
