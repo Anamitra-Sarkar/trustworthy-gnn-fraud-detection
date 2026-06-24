@@ -17,14 +17,15 @@ async def model_summary(authorization: str = Header(...)):
     calibration = model_loader.load_calibration()
 
     models = []
-    backbone_totals = defaultdict(lambda: {"count": 0, "f1": 0.0, "auc": 0.0})
+    backbone_totals = defaultdict(lambda: {"count": 0, "f1_fraud": 0.0, "auc": 0.0})
 
     for model_name, info in config.items():
         metrics = info.get("metrics", {}) or {}
         if not metrics:
             continue
 
-        f1 = float(metrics.get("f1_macro", 0.0))
+        f1_macro = float(metrics.get("f1_macro", 0.0))
+        f1_fraud = float(metrics.get("f1_fraud", f1_macro))
         auc = float(metrics.get("auc_roc", 0.0))
         backbone = info.get("backbone", "unknown")
         entry = {
@@ -34,7 +35,8 @@ async def model_summary(authorization: str = Header(...)):
             "topology": info.get("topology", "original"),
             "edl": bool(info.get("edl", False)),
             "feature_dim": info.get("feature_dim"),
-            "f1": f1,
+            "f1_macro": f1_macro,
+            "f1_fraud": f1_fraud,
             "auc": auc,
             "precision_fraud": float(metrics.get("precision_fraud", 0.0)),
             "recall_fraud": float(metrics.get("recall_fraud", 0.0)),
@@ -43,22 +45,22 @@ async def model_summary(authorization: str = Header(...)):
 
         bucket = backbone_totals[backbone]
         bucket["count"] += 1
-        bucket["f1"] += f1
+        bucket["f1_fraud"] += f1_fraud
         bucket["auc"] += auc
 
     model_performance = []
     for backbone, bucket in backbone_totals.items():
         count = max(bucket["count"], 1)
         model_performance.append(
-            {
-                "backbone": backbone.upper(),
-                "f1": round(bucket["f1"] / count, 4),
-                "auc": round(bucket["auc"] / count, 4),
-            }
+                {
+                    "backbone": backbone.upper(),
+                    "f1": round(bucket["f1_fraud"] / count, 4),
+                    "auc": round(bucket["auc"] / count, 4),
+                }
         )
     model_performance.sort(key=lambda item: item["f1"], reverse=True)
 
-    models.sort(key=lambda item: item["f1"], reverse=True)
+    models.sort(key=lambda item: (item["f1_fraud"], item["auc"]), reverse=True)
     best_model = models[0] if models else None
     calibration_entries = len(calibration) if isinstance(calibration, dict) else 0
 

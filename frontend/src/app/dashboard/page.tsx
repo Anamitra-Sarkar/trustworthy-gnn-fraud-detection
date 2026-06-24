@@ -29,7 +29,8 @@ type ModelSummary = {
   best_model?: {
     model_name: string;
     backbone: string;
-    f1: number;
+    f1_macro: number;
+    f1_fraud: number;
     auc: number;
   } | null;
   model_performance: Array<{
@@ -160,7 +161,7 @@ export default function DashboardPage() {
         },
         {
           label: "Best Fraud F1",
-          value: summary.best_model ? summary.best_model.f1.toFixed(2) : "0.00",
+          value: summary.best_model ? summary.best_model.f1_fraud.toFixed(2) : "0.00",
           change: summary.best_model?.model_name ?? "No model",
           icon: TrendingUp,
           color: "from-emerald-500 to-teal-400",

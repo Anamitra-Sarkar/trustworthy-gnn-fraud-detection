@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Kaggle Training Script: Trustworthy GNN Financial Fraud Detection (v4)
-CPU-only training with feature engineering + residual connections + DropEdge + ensemble.
-Trains 3 backbones x 2 topologies = 6 models.
+Kaggle Training Script: Trustworthy GNN Financial Fraud Detection (v5)
+GPU/CPU training with feature engineering + residual connections + DropEdge + ensemble.
+Trains 3 backbones x 5 topologies = 15 models.
 """
 
 import os, json, subprocess, sys, functools, traceback, gc
@@ -13,7 +13,7 @@ def install_deps():
     subprocess.check_call([
         sys.executable, "-m", "pip", "install", "-q",
         "torch-geometric", "safetensors", "huggingface_hub", "scikit-learn",
-        "networkx",
+        "networkx", "pynndescent",
     ])
     print("Dependencies ready!")
 
@@ -28,9 +28,9 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.metrics import f1_score, roc_auc_score, precision_score, recall_score
 from sklearn.neighbors import NearestNeighbors
-from sklearn.metrics.pairwise import cosine_similarity
 from torch_geometric.data import Data
 from torch_geometric.nn import SAGEConv, GATConv, GCNConv
+from pynndescent import NNDescent
 from safetensors.torch import save_file
 from huggingface_hub import HfApi, login
 
@@ -56,12 +56,12 @@ if not os.path.exists(os.path.join(DATA_DIR, "elliptic_txs_features.csv")):
     DATA_DIR = "/kaggle/input/datasets/organizations/ellipticco/elliptic-data-set/elliptic_bitcoin_dataset"
 
 HIDDEN = 128
-NUM_LAYERS = 4
-DROPOUT = 0.25
-EPOCHS = 120
-PATIENCE = 18
+NUM_LAYERS = 3
+DROPOUT = 0.3
+EPOCHS = 160
+PATIENCE = 20
 LR = 5e-4
-WEIGHT_DECAY = 1e-4
+WEIGHT_DECAY = 5e-4
 EDGE_DROP_RATE = 0.1  # DropEdge regularization
 LABEL_SMOOTHING = 0.05
 
@@ -276,8 +276,53 @@ def load_elliptic():
         test_mask=torch.tensor(test_mask),
     ), timesteps, features
 
+def _unique_edge_index(src_list, dst_list):
+    if not src_list:
+        return torch.zeros((2, 0), dtype=torch.long)
+    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
+    return torch.unique(edge_index, dim=1)
+
+def _approx_neighbors(x, k, metric="euclidean", n_iters=10, random_state=42):
+    x = np.asarray(x, dtype=np.float32)
+    if len(x) <= k + 1:
+        nn = NearestNeighbors(n_neighbors=min(k + 1, len(x)), metric=metric, n_jobs=-1)
+        nn.fit(x)
+        return nn.kneighbors(x)
+    index = NNDescent(
+        x,
+        n_neighbors=k + 1,
+        metric=metric,
+        n_trees=20,
+        n_iters=n_iters,
+        random_state=random_state,
+    )
+    indices, distances = index.query(x, k=k + 1)
+    return distances, indices
+
+def build_knn_graph(x, k=5):
+    """Build a sparse symmetric k-NN graph using approximate neighbors."""
+    _, indices = _approx_neighbors(x, k=k, metric="euclidean")
+    src_list, dst_list = [], []
+    for i in range(len(indices)):
+        for j in indices[i, 1:]:
+            src_list.extend([i, int(j)])
+            dst_list.extend([int(j), i])
+    return _unique_edge_index(src_list, dst_list)
+
+def build_similarity_graph(x, threshold=0.92, k=12):
+    """Build a sparse cosine-similarity graph with approximate neighbors."""
+    distances, indices = _approx_neighbors(x, k=k, metric="cosine")
+    src_list, dst_list = [], []
+    for i in range(len(indices)):
+        for dist, j in zip(distances[i, 1:], indices[i, 1:]):
+            sim = 1.0 - float(dist)
+            if sim >= threshold:
+                src_list.extend([i, int(j)])
+                dst_list.extend([int(j), i])
+    return _unique_edge_index(src_list, dst_list)
+
 def build_temporal_snap_graph(x, timesteps, k=5):
-    """Multi-snapshot temporal graph: link nodes across consecutive timesteps."""
+    """Link nodes across consecutive timesteps with approximate cross-step kNN."""
     unique = np.sort(np.unique(timesteps))
     src_list, dst_list = [], []
     for i in range(len(unique) - 1):
@@ -285,14 +330,33 @@ def build_temporal_snap_graph(x, timesteps, k=5):
         next_ = np.where(timesteps == unique[i + 1])[0]
         if len(next_) == 0: continue
         actual_k = min(k, len(next_))
-        nn_model = NearestNeighbors(n_neighbors=actual_k, metric='euclidean', n_jobs=1)
-        nn_model.fit(x[next_])
-        _, indices = nn_model.kneighbors(x[curr])
-        gi, gj = np.repeat(curr, actual_k), next_[indices.flatten()]
-        src_list.extend(np.concatenate([gi, gj]))
-        dst_list.extend(np.concatenate([gj, gi]))
-    if not src_list: return torch.zeros((2, 0), dtype=torch.long)
-    return torch.unique(torch.tensor([src_list, dst_list], dtype=torch.long), dim=1)
+        if actual_k <= 0:
+            continue
+        if len(next_) <= actual_k + 1:
+            nn_model = NearestNeighbors(n_neighbors=actual_k, metric='euclidean', n_jobs=-1)
+            nn_model.fit(x[next_])
+            _, indices = nn_model.kneighbors(x[curr])
+        else:
+            index = NNDescent(
+                np.asarray(x[next_], dtype=np.float32),
+                n_neighbors=actual_k,
+                metric="euclidean",
+                n_trees=15,
+                n_iters=8,
+                random_state=42,
+            )
+            indices, _ = index.query(np.asarray(x[curr], dtype=np.float32), k=actual_k)
+        gi = np.repeat(curr, actual_k)
+        gj = next_[indices.flatten()]
+        src_list.extend(np.concatenate([gi, gj]).tolist())
+        dst_list.extend(np.concatenate([gj, gi]).tolist())
+    return _unique_edge_index(src_list, dst_list)
+
+def build_augmented_graph(original_edge_index, x, threshold=0.92, k=12):
+    """Combine original transaction edges with similarity edges."""
+    sim_edges = build_similarity_graph(x, threshold=threshold, k=k)
+    combined = torch.cat([original_edge_index, sim_edges], dim=1)
+    return torch.unique(combined, dim=1)
 
 # ── DropEdge ─────────────────────────────────────────────────────────
 
@@ -301,7 +365,7 @@ def drop_edge(edge_index, drop_rate=EDGE_DROP_RATE, training=True):
     if not training or drop_rate <= 0:
         return edge_index
     n = edge_index.shape[1]
-    keep = torch.rand(n) > drop_rate
+    keep = torch.rand(n, device=edge_index.device) > drop_rate
     return edge_index[:, keep]
 
 # ── Training ─────────────────────────────────────────────────────────
@@ -309,6 +373,7 @@ def drop_edge(edge_index, drop_rate=EDGE_DROP_RATE, training=True):
 def train_model(model, data, device):
     model = model.to(device)
     data = data.to(device)
+    val_mask = data.val_mask.detach().cpu().numpy()
     num_pos = data.y[data.train_mask].sum().item()
     num_neg = data.train_mask.sum().item() - num_pos
     pos_weight = num_neg / max(num_pos, 1)
@@ -335,8 +400,8 @@ def train_model(model, data, device):
         scheduler.step()
         model.eval()
         with torch.no_grad():
-            val_probs = F.softmax(model(data.x, data.edge_index), dim=-1)[data.val_mask, 1].cpu().numpy()
-            val_true = data.y[data.val_mask].cpu().numpy()
+            val_probs = F.softmax(model(data.x, data.edge_index), dim=-1).cpu().numpy()[val_mask, 1]
+            val_true = data.y[data.val_mask].detach().cpu().numpy()
             best_val_f1 = 0.0
             for thresh in np.arange(0.01, 0.99, 0.01):
                 f1v = f1_score(val_true, (val_probs > thresh).astype(int), average='binary', pos_label=1, zero_division=0)
@@ -356,14 +421,16 @@ def train_model(model, data, device):
 def evaluate_model(model, data, device):
     model.eval()
     data = data.to(device)
+    val_mask = data.val_mask.detach().cpu().numpy()
+    test_mask = data.test_mask.detach().cpu().numpy()
     with torch.no_grad():
         probs = F.softmax(model(data.x, data.edge_index), dim=-1).cpu().numpy()
-    val_probs, val_true = probs[data.val_mask.numpy(), 1], data.y[data.val_mask].numpy()
+    val_probs, val_true = probs[val_mask, 1], data.y[data.val_mask].detach().cpu().numpy()
     best_thresh, best_val_f1 = 0.5, 0.0
     for thresh in np.arange(0.01, 0.99, 0.01):
         f1v = f1_score(val_true, (val_probs > thresh).astype(int), average='binary', pos_label=1, zero_division=0)
         if f1v > best_val_f1: best_val_f1, best_thresh = f1v, thresh
-    test_probs, test_true = probs[data.test_mask.numpy(), 1], data.y[data.test_mask].numpy()
+    test_probs, test_true = probs[test_mask, 1], data.y[data.test_mask].detach().cpu().numpy()
     test_pred = (test_probs > best_thresh).astype(int)
     metrics = {"f1_macro": float(f1_score(test_true, test_pred, average='macro', zero_division=0)),
                "f1_fraud": float(f1_score(test_true, test_pred, average='binary', pos_label=1, zero_division=0)),
@@ -384,9 +451,11 @@ def compute_aps(probs, true_label):
 def calibrate(model, data, device, name):
     model.eval()
     data_dev = data.to(device)
+    val_mask = data.val_mask.detach().cpu().numpy()
+    test_mask = data.test_mask.detach().cpu().numpy()
     with torch.no_grad():
         probs = F.softmax(model(data_dev.x, data_dev.edge_index), dim=-1).cpu().numpy()
-    vp, vl = probs[data.val_mask.numpy()], data.y[data.val_mask].numpy()
+    vp, vl = probs[val_mask], data.y[data.val_mask].detach().cpu().numpy()
     n = len(vl)
     scores = np.array([compute_aps(vp[i], vl[i]) for i in range(n)])
     ALPHA = 0.1
@@ -400,7 +469,7 @@ def calibrate(model, data, device, name):
             nc = len(cs)
             qc = min(np.ceil((nc + 1) * (1 - ALPHA)) / nc, 1.0)
             mondrian[str(c)] = float(np.quantile(cs, qc))
-    tp, tl = probs[data.test_mask.numpy()], data.y[data.test_mask].numpy()
+    tp, tl = probs[test_mask], data.y[data.test_mask].detach().cpu().numpy()
     covered = 0
     for i in range(len(tl)):
         p, xi = tp[i], np.random.uniform(0, 1)
@@ -419,11 +488,13 @@ def calibrate(model, data, device, name):
 def ensemble_predict(models, data, device):
     """Average predictions from all models."""
     all_probs = []
+    data_x = data.x.to(device)
+    data_ei = data.edge_index.to(device)
     for model in models:
         model.eval()
         model = model.to(device)
         with torch.no_grad():
-            probs = F.softmax(model(data.x.to(device), data.edge_index.to(device)), dim=-1).cpu().numpy()
+            probs = F.softmax(model(data_x, data_ei), dim=-1).cpu().numpy()
         all_probs.append(probs[:, 1])
         model.cpu()
         gc.collect()
@@ -456,9 +527,16 @@ def main():
 
     print("\nBuilding topologies...")
     topologies = {"original": data.edge_index}
-    print("  temporal...")
-    topologies["temporal"] = build_temporal_snap_graph(x_np, timesteps, k=3)
-    print(f"  Edges: {topologies['temporal'].shape[1]}")
+    topology_builders = [
+        ("knn", lambda: build_knn_graph(x_np, k=5)),
+        ("similarity", lambda: build_similarity_graph(x_np, threshold=0.92, k=12)),
+        ("temporal", lambda: build_temporal_snap_graph(x_np, timesteps, k=3)),
+        ("augmented", lambda: build_augmented_graph(data.edge_index, x_np, threshold=0.92, k=12)),
+    ]
+    for name, builder in topology_builders:
+        print(f"  Building {name}...")
+        topologies[name] = builder()
+        print(f"  {name} edges: {topologies[name].shape[1]}")
 
     in_channels = data.x.shape[1]
     model_config, all_metrics, cal_data = {}, {}, {}
@@ -499,14 +577,16 @@ def main():
         print(f"\n{'='*60}\nEnsemble Evaluation ({len(trained_models)} models)\n{'='*60}")
         ref_data = trained_models[0][2]
         avg_probs = ensemble_predict([m for _, m, _ in trained_models], ref_data, device)
-        test_true = ref_data.y[ref_data.test_mask].numpy()
-        val_true = ref_data.y[ref_data.val_mask].numpy()
-        val_probs = avg_probs[ref_data.val_mask.numpy()]
+        val_mask = ref_data.val_mask.detach().cpu().numpy()
+        test_mask = ref_data.test_mask.detach().cpu().numpy()
+        test_true = ref_data.y[ref_data.test_mask].detach().cpu().numpy()
+        val_true = ref_data.y[ref_data.val_mask].detach().cpu().numpy()
+        val_probs = avg_probs[val_mask]
         best_thresh, best_f1 = 0.5, 0.0
         for thresh in np.arange(0.01, 0.99, 0.01):
             f1v = f1_score(val_true, (val_probs > thresh).astype(int), average='binary', pos_label=1, zero_division=0)
             if f1v > best_f1: best_f1, best_thresh = f1v, thresh
-        test_pred = (avg_probs[ref_data.test_mask.numpy()] > best_thresh).astype(int)
+        test_pred = (avg_probs[test_mask] > best_thresh).astype(int)
         ens_metrics = {
             "f1_macro": float(f1_score(test_true, test_pred, average='macro', zero_division=0)),
             "f1_fraud": float(f1_score(test_true, test_pred, average='binary', pos_label=1, zero_division=0)),
@@ -515,7 +595,7 @@ def main():
             "recall_fraud": float(recall_score(test_true, test_pred, pos_label=1, zero_division=0)),
             "best_threshold": float(best_thresh),
         }
-        try: ens_metrics["auc_roc"] = float(roc_auc_score(test_true, avg_probs[ref_data.test_mask.numpy()]))
+        try: ens_metrics["auc_roc"] = float(roc_auc_score(test_true, avg_probs[test_mask]))
         except: ens_metrics["auc_roc"] = 0.0
         all_metrics["ensemble"] = ens_metrics
         model_config["ensemble"] = {"backbone": "ensemble", "dataset": "elliptic", "topology": "all",
