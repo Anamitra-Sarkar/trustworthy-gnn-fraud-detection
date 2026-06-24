@@ -289,15 +289,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         try:
-            major, _ = torch.cuda.get_device_capability(0)
-            if major < 7:
-                print(f"WARNING: GPU sm_{major} < 7.0 incompatible. Falling back to CPU.")
-                device = torch.device("cpu")
-            else:
-                print(f"GPU: {torch.cuda.get_device_name(0)} (sm_{major})")
+            major, minor = torch.cuda.get_device_capability(0)
+            print(f"GPU: {torch.cuda.get_device_name(0)} (sm_{major}.{minor})")
         except Exception as e:
-            print(f"GPU check failed: {e}. Falling back to CPU.")
-            device = torch.device("cpu")
+            print(f"GPU check failed: {e}. Continuing on CUDA because it is available.")
     print(f"Device: {device}")
     data = load_elliptic()
     in_ch = data.x.shape[1]
