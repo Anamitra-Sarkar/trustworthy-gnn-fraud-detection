@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useRef, useCallback } from "react";
 import {
   BarChart,
   Bar,
@@ -16,6 +16,8 @@ import {
   Database,
   ArrowUpDown,
   Loader2,
+  FileSpreadsheet,
+  AlertCircle,
 } from "lucide-react";
 import Header from "@/components/layout/Header";
 import UncertaintyGauge from "@/components/uncertainty/UncertaintyGauge";
@@ -54,6 +56,11 @@ export default function AnalysisPage() {
   const [results, setResults] = useState<InferenceResult[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [fileName, setFileName] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     let alive = true;
@@ -71,6 +78,72 @@ export default function AnalysisPage() {
     })();
     return () => { alive = false; };
   }, []);
+
+  const parseCSV = useCallback((text: string): number[][] => {
+    const lines = text.trim().split("\n");
+    return lines.map((line) =>
+      line.split(",").map((v) => {
+        const n = parseFloat(v.trim());
+        if (isNaN(n)) throw new Error(`Non-numeric value in CSV: ${v.trim()}`);
+        return n;
+      })
+    );
+  }, []);
+
+  const parseJSON = useCallback((text: string): number[][] => {
+    const parsed = JSON.parse(text);
+    const arr = Array.isArray(parsed) ? parsed : (parsed as Record<string, unknown>).features ?? (parsed as Record<string, unknown>).feature_matrix ?? [];
+    if (!Array.isArray(arr)) throw new Error("JSON must contain an array or { features: [...] }");
+    return arr.map((row: unknown) => {
+      if (Array.isArray(row)) return row.map((v: unknown) => { const n = Number(v); if (isNaN(n)) throw new Error(`Non-numeric: ${v}`); return n; });
+      throw new Error("Each row must be an array of numbers");
+    });
+  }, []);
+
+  const handleFile = useCallback(async (file: File) => {
+    setUploadError(null);
+    setFileName(file.name);
+    setUploading(true);
+    try {
+      const text = await file.text();
+      let matrix: number[][];
+      if (file.name.endsWith(".csv")) {
+        matrix = parseCSV(text);
+      } else if (file.name.endsWith(".json")) {
+        matrix = parseJSON(text);
+      } else {
+        throw new Error("Unsupported file type. Use .csv or .json");
+      }
+      if (matrix.length === 0) throw new Error("Empty file");
+      if (matrix.length > 1000) throw new Error("Max 1000 rows supported. Got " + matrix.length);
+      const data = await api.batchInfer({ feature_matrix: matrix });
+      const inferred = ((data as Record<string, unknown>).results ?? (data as Record<string, unknown>[])) as InferenceResult[];
+      if (inferred.length > 0) {
+        setResults(inferred);
+        setMode("demo");
+      } else {
+        throw new Error("No results returned from inference");
+      }
+    } catch (e) {
+      setUploadError(e instanceof Error ? e.message : "Upload failed");
+    } finally {
+      setUploading(false);
+    }
+  }, [parseCSV, parseJSON, setResults, setMode]);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(false);
+    const file = e.dataTransfer.files[0];
+    if (file) handleFile(file);
+  }, [handleFile]);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    setDragOver(true);
+  }, []);
+
+  const handleDragLeave = useCallback(() => setDragOver(false), []);
 
   const handleSort = (key: SortKey) => {
     if (sortKey === key) {
@@ -141,17 +214,61 @@ export default function AnalysisPage() {
           </div>
         ) : (<>
         {mode === "upload" && (
-          <div className="glass flex flex-col items-center justify-center rounded-xl border-2 border-dashed border-border p-12">
-            <Upload className="mb-3 h-10 w-10 text-muted-foreground" />
-            <p className="text-sm font-medium text-foreground">
-              Drop your CSV or JSON file here
-            </p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Feature matrix for batch inference
-            </p>
-            <button className="mt-4 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white hover:bg-primary/90">
-              Browse Files
-            </button>
+          <div
+            onDrop={handleDrop}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            className={cn(
+              "flex flex-col items-center justify-center rounded-xl border-2 border-dashed p-12 transition-colors",
+              dragOver
+                ? "border-primary bg-primary/5"
+                : "border-border",
+              uploading && "pointer-events-none opacity-60"
+            )}
+          >
+            {uploading ? (
+              <>
+                <Loader2 className="mb-3 h-10 w-10 animate-spin text-primary" />
+                <p className="text-sm font-medium text-foreground">
+                  Processing {fileName}...
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Running batch inference
+                </p>
+              </>
+            ) : (
+              <>
+                <Upload className="mb-3 h-10 w-10 text-muted-foreground" />
+                <p className="text-sm font-medium text-foreground">
+                  {dragOver ? "Drop it!" : "Drop your CSV or JSON file here"}
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Feature matrix for batch inference (max 1000 rows)
+                </p>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".csv,.json"
+                  className="hidden"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) handleFile(file);
+                  }}
+                />
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  className="mt-4 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white hover:bg-primary/90"
+                >
+                  Browse Files
+                </button>
+              </>
+            )}
+            {uploadError && (
+              <div className="mt-4 flex items-center gap-2 rounded-lg bg-destructive/10 px-4 py-2 text-sm text-destructive">
+                <AlertCircle className="h-4 w-4 shrink-0" />
+                {uploadError}
+              </div>
+            )}
           </div>
         )}
 
