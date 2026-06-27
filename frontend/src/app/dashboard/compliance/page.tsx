@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { Shield, FileText, ChevronRight, Plus, X, Loader2 } from "lucide-react";
+import { useState, useEffect, useCallback } from "react";
+import { Shield, FileText, ChevronRight, Plus, X, Loader2, AlertCircle } from "lucide-react";
 import Header from "@/components/layout/Header";
 import ReportViewer from "@/components/compliance/ReportViewer";
 import { cn } from "@/lib/utils";
@@ -33,30 +33,39 @@ export default function CompliancePage() {
   const [reports, setReports] = useState<Record<string, unknown>[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [generating, setGenerating] = useState(false);
+  const [genError, setGenError] = useState<string | null>(null);
+
+  const loadReports = useCallback(async () => {
+    try {
+      const data = await api.getEscalations();
+      const escalated = Array.isArray(data) ? data : [];
+      const reportsWithMeta = escalated.map((e: Record<string, unknown>, i: number) => ({
+        id: e.id ?? `RPT-${String(i + 1).padStart(3, "0")}`,
+        node_id: e.node_id ?? "Unknown",
+        risk_classification: (e.priority === "critical" || e.priority === "high")
+          ? "high" : "medium",
+        prediction: ((e.risk_score as number) ?? 0) > 0.5 ? 1 : 0,
+        confidence: Math.min(1, ((e.risk_score as number) ?? 0) + 0.3),
+        risk_score: e.risk_score ?? 0,
+        escalation_status: e.status ?? "pending",
+        generated_at: e.created_at ?? new Date().toISOString(),
+        summary: (e.reason as string) ?? "No summary available",
+        key_metrics: {
+          risk_score: (e.risk_score as number) ?? 0,
+        },
+      }));
+      setReports(reportsWithMeta);
+    } catch (e) {
+      throw e;
+    }
+  }, []);
 
   useEffect(() => {
     let alive = true;
     (async () => {
       try {
-        const data = await api.getEscalations();
-        if (!alive) return;
-        const escalated = Array.isArray(data) ? data : [];
-        const reportsWithMeta = escalated.map((e: Record<string, unknown>, i: number) => ({
-          id: e.id ?? `RPT-${String(i + 1).padStart(3, "0")}`,
-          node_id: e.node_id ?? "Unknown",
-          risk_classification: (e.priority === "critical" || e.priority === "high")
-            ? "high" : "medium",
-          prediction: ((e.risk_score as number) ?? 0) > 0.5 ? 1 : 0,
-          confidence: Math.min(1, ((e.risk_score as number) ?? 0) + 0.3),
-          risk_score: e.risk_score ?? 0,
-          escalation_status: e.status ?? "pending",
-          generated_at: e.created_at ?? new Date().toISOString(),
-          summary: (e.reason as string) ?? "No summary available",
-          key_metrics: {
-            risk_score: (e.risk_score as number) ?? 0,
-          },
-        }));
-        setReports(reportsWithMeta);
+        await loadReports();
       } catch (e) {
         if (!alive) return;
         setError(e instanceof Error ? e.message : "Failed to load compliance reports");
@@ -65,7 +74,34 @@ export default function CompliancePage() {
       }
     })();
     return () => { alive = false; };
-  }, []);
+  }, [loadReports]);
+
+  const handleGenerate = useCallback(async () => {
+    setGenerating(true);
+    setGenError(null);
+    try {
+      const demoData = await api.getDemoData();
+      const flagged = (demoData.results ?? [])
+        .filter((r) => r.prediction === 1)
+        .sort((a, b) => b.risk_score - a.risk_score)
+        .slice(0, 5);
+      if (flagged.length === 0) throw new Error("No flagged transactions to generate reports from");
+      for (const f of flagged) {
+        await api.escalate({
+          node_id: f.node_id,
+          risk_score: f.risk_score,
+          reason: f.uncertainty.evidential
+            ? `Fraud detected. Confidence=${(f.uncertainty.confidence * 100).toFixed(0)}%, Dirichlet strength=${f.uncertainty.evidential.dirichlet_strength?.toFixed(1)}`
+            : `Fraud detected. Confidence=${(f.uncertainty.confidence * 100).toFixed(0)}%`,
+        });
+      }
+      await loadReports();
+    } catch (e) {
+      setGenError(e instanceof Error ? e.message : "Failed to generate reports");
+    } finally {
+      setGenerating(false);
+    }
+  }, [loadReports]);
 
   return (
     <>
@@ -86,11 +122,25 @@ export default function CompliancePage() {
           <p className="text-sm text-muted-foreground">
             {reports.length} compliance reports generated
           </p>
-          <button className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white hover:bg-primary/90">
-            <Plus className="h-4 w-4" />
-            Generate Report
+          <button
+            onClick={handleGenerate}
+            disabled={generating}
+            className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-primary/90 disabled:opacity-50"
+          >
+            {generating ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Plus className="h-4 w-4" />
+            )}
+            {generating ? "Generating..." : "Generate Report"}
           </button>
         </div>
+        {genError && (
+          <div className="flex items-center gap-2 rounded-lg bg-destructive/10 px-4 py-2 text-sm text-destructive">
+            <AlertCircle className="h-4 w-4 shrink-0" />
+            {genError}
+          </div>
+        )}
 
         <div className="flex gap-6">
           {/* Report Cards */}

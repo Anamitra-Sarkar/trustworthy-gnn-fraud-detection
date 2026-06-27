@@ -1,6 +1,6 @@
 "use client";
 
-import { Bell, Search, Sun, Moon } from "lucide-react";
+import { Search, Sun, Moon } from "lucide-react";
 import { useTheme } from "next-themes";
 import { useAuth } from "@/hooks/useAuth";
 
@@ -26,12 +26,6 @@ export default function Header({ title }: HeaderProps) {
             className="h-9 w-64 rounded-lg border border-border bg-secondary pl-9 pr-4 text-sm text-foreground placeholder:text-muted-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
           />
         </div>
-
-        {/* Notifications */}
-        <button className="relative rounded-lg p-2 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground">
-          <Bell className="h-5 w-5" />
-          <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-destructive" />
-        </button>
 
         {/* Theme Toggle */}
         <button
