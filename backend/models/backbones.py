@@ -14,7 +14,7 @@ class LayerNorm(nn.Module):
 
 
 class GraphSAGEBackbone(nn.Module):
-    def __init__(self, in_channels: int, hidden_channels: int = 128, out_channels: int = 2,
+    def __init__(self, in_channels: int, hidden_channels: int = 256, out_channels: int = 2,
                  num_layers: int = 3, dropout: float = 0.3):
         super().__init__()
         self.dropout = dropout
@@ -50,7 +50,7 @@ class GraphSAGEBackbone(nn.Module):
 
 
 class GATBackbone(nn.Module):
-    def __init__(self, in_channels: int, hidden_channels: int = 128, out_channels: int = 2,
+    def __init__(self, in_channels: int, hidden_channels: int = 256, out_channels: int = 2,
                  num_layers: int = 3, dropout: float = 0.3, heads: int = 4):
         super().__init__()
         self.dropout = dropout
@@ -86,7 +86,7 @@ class GATBackbone(nn.Module):
 
 
 class GCNBackbone(nn.Module):
-    def __init__(self, in_channels: int, hidden_channels: int = 128, out_channels: int = 2,
+    def __init__(self, in_channels: int, hidden_channels: int = 256, out_channels: int = 2,
                  num_layers: int = 3, dropout: float = 0.3):
         super().__init__()
         self.dropout = dropout
@@ -127,17 +127,14 @@ class EDLWrapper(nn.Module):
         super().__init__()
         self.backbone = backbone
         self.num_classes = num_classes
-        last_conv = backbone.convs[-1]
-        if hasattr(last_conv, 'out_channels'):
-            in_features = last_conv.out_channels
-        else:
-            in_features = num_classes
         backbone.convs = backbone.convs[:-1]
+        last_hidden = backbone.convs[-1]
+        in_features = last_hidden.out_channels if hasattr(last_hidden, 'out_channels') else num_classes
         if hasattr(backbone, 'norms') and len(backbone.norms) >= len(backbone.convs) + 1:
             backbone.norms = backbone.norms[:len(backbone.convs)]
         if hasattr(backbone, 'residuals') and len(backbone.residuals) >= len(backbone.convs) + 1:
             backbone.residuals = backbone.residuals[:len(backbone.convs)]
-        self.evidence_layer = nn.Linear(in_features if in_features != num_classes else 128, num_classes)
+        self.evidence_layer = nn.Linear(in_features, num_classes)
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         for i, conv in enumerate(self.backbone.convs):
