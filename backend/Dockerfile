@@ -10,7 +10,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* && echo "deploy-ts=$(date +%s)" > /tmp/deploy_stamp
 
 COPY requirements.txt .
 RUN pip install --upgrade pip && \
