@@ -80,12 +80,13 @@ class ModelLoader:
         state_dict = load_file(path)
 
         in_channels = self._resolve_feature_dim(model_info, state_dict, backbone_type, is_edl)
+        hidden_channels = self._resolve_hidden_dim(state_dict, backbone_type, is_edl)
         backbone_cls = BACKBONE_REGISTRY[backbone_type]
         if is_edl:
-            backbone = backbone_cls(in_channels=in_channels, hidden_channels=128, out_channels=128)
+            backbone = backbone_cls(in_channels=in_channels, hidden_channels=hidden_channels, out_channels=hidden_channels)
             model = EDLWrapper(backbone, num_classes=2)
         else:
-            model = backbone_cls(in_channels=in_channels, hidden_channels=128, out_channels=2)
+            model = backbone_cls(in_channels=in_channels, hidden_channels=hidden_channels, out_channels=2)
 
         try:
             model.load_state_dict(state_dict)
@@ -120,6 +121,30 @@ class ModelLoader:
                         "edl": True,
                     }
         return configs
+
+    def _resolve_hidden_dim(self, state_dict: dict, backbone_type: str, is_edl: bool) -> int:
+        """Infer hidden_channels from the first hidden layer's output dimension in the checkpoint."""
+        prefix = "backbone." if is_edl else ""
+
+        # For GraphSAGE and GCN: convs.0.lin_l.weight has shape [hidden, in]
+        # For GAT: convs.0.lin_src.weight has shape [hidden//heads * heads, in] -> still shape[0]
+        key_candidates = {
+            "graphsage": [f"{prefix}convs.0.lin_l.weight"],
+            "gat": [f"{prefix}convs.0.lin_src.weight", f"{prefix}convs.0.att_src"],
+            "gcn": [f"{prefix}convs.0.lin.weight"],
+        }.get(backbone_type, [])
+
+        for key in key_candidates:
+            tensor = state_dict.get(key)
+            if tensor is not None and getattr(tensor, "ndim", 0) >= 1:
+                return int(tensor.shape[0])
+
+        # Fallback: find first intermediate conv weight output dim
+        for key, tensor in state_dict.items():
+            if "convs.0" in key and key.endswith(".weight") and getattr(tensor, "ndim", 0) == 2:
+                return int(tensor.shape[0])
+
+        return 256  # sensible default matching training config
 
     def _resolve_feature_dim(self, model_info: dict, state_dict: dict, backbone_type: str, is_edl: bool) -> int:
         feature_dim = model_info.get("feature_dim")
