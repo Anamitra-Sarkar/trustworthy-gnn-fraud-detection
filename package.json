@@ -1,0 +1,9 @@
+{
+  "name": "trustworthy-gnn-fraud-detection",
+  "private": true,
+  "scripts": {
+    "build": "cd frontend && npm run build",
+    "dev": "cd frontend && npm run dev",
+    "start": "cd frontend && npm run start"
+  }
+}
