@@ -1,97 +1,26 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   AlertTriangle,
   Clock,
   CheckCircle2,
   XCircle,
   Filter,
+  Loader2,
 } from "lucide-react";
 import Header from "@/components/layout/Header";
 import { cn } from "@/lib/utils";
-import type { Escalation } from "@/types";
-
-const mockEscalations: Escalation[] = [
-  {
-    id: "ESC-001",
-    node_id: "TXN-2003",
-    risk_score: 0.95,
-    reason:
-      "Critical fraud probability with multi-hop suspicious connections in transaction graph",
-    status: "open",
-    priority: "critical",
-    created_at: new Date(Date.now() - 1800000).toISOString(),
-    updated_at: new Date(Date.now() - 1800000).toISOString(),
-    assigned_to: "Senior Analyst",
-  },
-  {
-    id: "ESC-002",
-    node_id: "TXN-2007",
-    risk_score: 0.82,
-    reason:
-      "High risk transaction with links to previously flagged accounts in cluster analysis",
-    status: "reviewing",
-    priority: "high",
-    created_at: new Date(Date.now() - 7200000).toISOString(),
-    updated_at: new Date(Date.now() - 3600000).toISOString(),
-    assigned_to: "Compliance Team",
-  },
-  {
-    id: "ESC-003",
-    node_id: "TXN-2009",
-    risk_score: 0.67,
-    reason:
-      "Moderate risk with elevated uncertainty - model confidence below threshold for auto-clear",
-    status: "open",
-    priority: "medium",
-    created_at: new Date(Date.now() - 14400000).toISOString(),
-    updated_at: new Date(Date.now() - 14400000).toISOString(),
-  },
-  {
-    id: "ESC-004",
-    node_id: "TXN-2012",
-    risk_score: 0.55,
-    reason:
-      "Borderline classification with conflicting evidential signals between graph and feature-based analysis",
-    status: "reviewing",
-    priority: "medium",
-    created_at: new Date(Date.now() - 28800000).toISOString(),
-    updated_at: new Date(Date.now() - 14400000).toISOString(),
-    assigned_to: "ML Team",
-  },
-  {
-    id: "ESC-005",
-    node_id: "TXN-2001",
-    risk_score: 0.91,
-    reason:
-      "Confirmed fraud pattern matching historical laundering scheme topology",
-    status: "resolved",
-    priority: "critical",
-    created_at: new Date(Date.now() - 86400000).toISOString(),
-    updated_at: new Date(Date.now() - 43200000).toISOString(),
-    assigned_to: "Senior Analyst",
-  },
-  {
-    id: "ESC-006",
-    node_id: "TXN-2014",
-    risk_score: 0.42,
-    reason: "Low-confidence flagging, likely false positive based on review",
-    status: "resolved",
-    priority: "low",
-    created_at: new Date(Date.now() - 172800000).toISOString(),
-    updated_at: new Date(Date.now() - 86400000).toISOString(),
-  },
-];
+import { api } from "@/lib/api";
 
 const priorityConfig: Record<
   string,
-  { color: string; bg: string; icon: typeof AlertTriangle }
+  { color: string; bg: string }
 > = {
-  critical: { color: "text-red-400", bg: "bg-red-400/10", icon: AlertTriangle },
-  high: { color: "text-orange-400", bg: "bg-orange-400/10", icon: AlertTriangle },
-  medium: { color: "text-amber-400", bg: "bg-amber-400/10", icon: Clock },
-  low: { color: "text-emerald-400", bg: "bg-emerald-400/10", icon: CheckCircle2 },
+  critical: { color: "text-red-400", bg: "bg-red-400/10" },
+  high: { color: "text-orange-400", bg: "bg-orange-400/10" },
+  medium: { color: "text-amber-400", bg: "bg-amber-400/10" },
+  low: { color: "text-emerald-400", bg: "bg-emerald-400/10" },
 };
 
 const statusConfig: Record<string, { label: string; color: string }> = {
@@ -110,18 +39,62 @@ type StatusFilter = "all" | "open" | "reviewing" | "resolved";
 
 export default function EscalationsPage() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [escalations, setEscalations] = useState<Record<string, unknown>[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const data = await api.getEscalations();
+        if (!alive) return;
+        setEscalations(Array.isArray(data) ? data : []);
+      } catch (e) {
+        if (!alive) return;
+        setError(e instanceof Error ? e.message : "Failed to load escalations");
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
 
   const filtered =
     statusFilter === "all"
-      ? mockEscalations
-      : mockEscalations.filter((e) => e.status === statusFilter);
+      ? escalations
+      : escalations.filter((e) => (e as Record<string, string>).status === statusFilter);
 
   const counts = {
-    all: mockEscalations.length,
-    open: mockEscalations.filter((e) => e.status === "open").length,
-    reviewing: mockEscalations.filter((e) => e.status === "reviewing").length,
-    resolved: mockEscalations.filter((e) => e.status === "resolved").length,
+    all: escalations.length,
+    open: escalations.filter((e) => (e as Record<string, string>).status === "open").length,
+    reviewing: escalations.filter((e) => (e as Record<string, string>).status === "reviewing").length,
+    resolved: escalations.filter((e) => (e as Record<string, string>).status === "resolved").length,
   };
+
+  if (loading) {
+    return (
+      <>
+        <Header title="Escalations" />
+        <div className="flex flex-col items-center justify-center py-16">
+          <Loader2 className="h-8 w-8 animate-spin text-primary" />
+          <p className="mt-3 text-sm text-muted-foreground">Loading escalations...</p>
+        </div>
+      </>
+    );
+  }
+
+  if (error) {
+    return (
+      <>
+        <Header title="Escalations" />
+        <div className="flex flex-col items-center justify-center py-16">
+          <AlertTriangle className="h-8 w-8 text-destructive" />
+          <p className="mt-3 text-sm text-destructive">{error}</p>
+        </div>
+      </>
+    );
+  }
 
   return (
     <>
@@ -153,14 +126,14 @@ export default function EscalationsPage() {
 
         {/* Escalation Cards */}
         <div className="space-y-3">
-          {filtered.map((escalation) => {
-            const priority = priorityConfig[escalation.priority];
-            const status = statusConfig[escalation.status];
-            const PriorityIcon = priority.icon;
+          {filtered.map((esc) => {
+            const e = esc as Record<string, string | number>;
+            const priority = priorityConfig[e.priority as string] ?? priorityConfig.medium;
+            const status = statusConfig[e.status as string] ?? statusConfig.resolved;
 
             return (
               <div
-                key={escalation.id}
+                key={e.id as string}
                 className="glass rounded-xl p-5 transition-all hover:border-primary/20"
               >
                 <div className="flex items-start justify-between">
@@ -171,12 +144,12 @@ export default function EscalationsPage() {
                         priority.bg
                       )}
                     >
-                      <PriorityIcon className={cn("h-5 w-5", priority.color)} />
+                      <AlertTriangle className={cn("h-5 w-5", priority.color)} />
                     </div>
                     <div>
                       <div className="flex items-center gap-3">
                         <span className="font-mono text-sm font-medium text-foreground">
-                          {escalation.node_id}
+                          {e.node_id as string}
                         </span>
                         <span
                           className={cn(
@@ -185,7 +158,7 @@ export default function EscalationsPage() {
                             priority.color
                           )}
                         >
-                          {escalation.priority}
+                          {e.priority as string}
                         </span>
                         <span
                           className={cn(
@@ -197,36 +170,63 @@ export default function EscalationsPage() {
                         </span>
                       </div>
                       <p className="mt-1.5 max-w-xl text-sm text-muted-foreground">
-                        {escalation.reason}
+                        {e.reason as string}
                       </p>
                       <div className="mt-2 flex items-center gap-4 text-xs text-muted-foreground">
                         <span>
-                          Risk: {(escalation.risk_score * 100).toFixed(0)}%
+                          Risk: {((e.risk_score as number) * 100).toFixed(0)}%
                         </span>
-                        <span>{escalation.id}</span>
-                        {escalation.assigned_to && (
-                          <span>Assigned: {escalation.assigned_to}</span>
+                        <span>{e.id as string}</span>
+                        {e.assigned_to && (
+                          <span>Assigned: {e.assigned_to as string}</span>
                         )}
                         <span>
-                          {new Date(escalation.created_at).toLocaleString()}
+                          {new Date(e.created_at as string).toLocaleString()}
                         </span>
                       </div>
                     </div>
                   </div>
 
                   {/* Status Update Buttons */}
-                  {escalation.status !== "resolved" && (
+                  {e.status !== "resolved" && (
                     <div className="flex gap-2">
-                      {escalation.status === "open" && (
-                        <button className="rounded-lg border border-blue-500/30 px-3 py-1.5 text-xs font-medium text-blue-400 transition-colors hover:bg-blue-400/10">
+                      {e.status === "open" && (
+                        <button
+                          onClick={async () => {
+                            try {
+                              await api.updateEscalation(e.id as string, { status: "reviewing" });
+                              const data = await api.getEscalations();
+                              setEscalations(Array.isArray(data) ? data : []);
+                            } catch {}
+                          }}
+                          className="rounded-lg border border-blue-500/30 px-3 py-1.5 text-xs font-medium text-blue-400 transition-colors hover:bg-blue-400/10"
+                        >
                           Start Review
                         </button>
                       )}
-                      <button className="rounded-lg border border-emerald-500/30 px-3 py-1.5 text-xs font-medium text-emerald-400 transition-colors hover:bg-emerald-400/10">
+                      <button
+                        onClick={async () => {
+                          try {
+                            await api.updateEscalation(e.id as string, { status: "resolved" });
+                            const data = await api.getEscalations();
+                            setEscalations(Array.isArray(data) ? data : []);
+                          } catch {}
+                        }}
+                        className="rounded-lg border border-emerald-500/30 px-3 py-1.5 text-xs font-medium text-emerald-400 transition-colors hover:bg-emerald-400/10"
+                      >
                         <CheckCircle2 className="mr-1 inline h-3 w-3" />
                         Resolve
                       </button>
-                      <button className="rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary">
+                      <button
+                        onClick={async () => {
+                          try {
+                            await api.updateEscalation(e.id as string, { status: "dismissed" });
+                            const data = await api.getEscalations();
+                            setEscalations(Array.isArray(data) ? data : []);
+                          } catch {}
+                        }}
+                        className="rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary"
+                      >
                         <XCircle className="mr-1 inline h-3 w-3" />
                         Dismiss
                       </button>

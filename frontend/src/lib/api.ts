@@ -50,14 +50,14 @@ export const api = {
     backbone?: string;
     uq_method?: string;
   }) {
-    return request("/api/batch-infer", {
+    return request("/api/batch", {
       method: "POST",
       body: JSON.stringify(data),
     });
   },
 
   getAnalysis(id: string) {
-    return request(`/api/analysis/${id}`);
+    return request(`/api/uncertainty-report/${id}`);
   },
 
   getAnalyses() {
@@ -69,7 +69,7 @@ export const api = {
     risk_score: number;
     reason: string;
   }) {
-    return request("/api/escalate", {
+    return request("/api/compliance/escalate", {
       method: "POST",
       body: JSON.stringify(data),
     });
@@ -77,14 +77,21 @@ export const api = {
 
   getEscalations(status?: string) {
     const query = status ? `?status=${status}` : "";
-    return request(`/api/escalations${query}`);
+    return request(`/api/compliance/escalations${query}`);
+  },
+
+  updateEscalation(id: string, data: Record<string, unknown>) {
+    return request(`/api/compliance/escalations/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(data),
+    });
   },
 
   getModelSummary() {
     return request("/api/models/summary");
   },
 
-  getDemoData() {
+  getDemoData(): Promise<import("@/types").DemoData> {
     return request("/api/demo/elliptic");
   },
 };

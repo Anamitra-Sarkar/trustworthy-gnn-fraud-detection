@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import {
   BarChart,
   Bar,
@@ -15,43 +15,14 @@ import {
   Upload,
   Database,
   ArrowUpDown,
+  Loader2,
 } from "lucide-react";
 import Header from "@/components/layout/Header";
 import UncertaintyGauge from "@/components/uncertainty/UncertaintyGauge";
 import EvidentialTriangle from "@/components/uncertainty/EvidentialTriangle";
 import { cn } from "@/lib/utils";
+import { api } from "@/lib/api";
 import type { InferenceResult } from "@/types";
-
-// Mock results data
-const mockResults: InferenceResult[] = Array.from({ length: 20 }, (_, i) => {
-  const riskScore = Math.random();
-  const confidence = 0.6 + Math.random() * 0.4;
-  return {
-    node_id: `TXN-${2000 + i}`,
-    prediction: riskScore > 0.55 ? 1 : 0,
-    probability: confidence,
-    risk_score: riskScore,
-    label: riskScore > 0.55 ? "Fraud" : "Legitimate",
-    backbone: ["GCN", "GAT", "GraphSAGE", "GIN", "GAT-v2"][
-      Math.floor(Math.random() * 5)
-    ],
-    uncertainty: {
-      method: "evidential",
-      confidence,
-      evidential: {
-        belief: riskScore * 0.8,
-        disbelief: (1 - riskScore) * 0.7,
-        uncertainty: 0.1 + Math.random() * 0.2,
-        base_rate: 0.5,
-        alpha: [2 + Math.random() * 5, 2 + Math.random() * 5],
-        dirichlet_strength: 4 + Math.random() * 10,
-      },
-    },
-    timestamp: new Date(
-      Date.now() - Math.random() * 86400000 * 7
-    ).toISOString(),
-  };
-});
 
 type SortKey = "node_id" | "prediction" | "probability" | "risk_score";
 
@@ -80,6 +51,26 @@ export default function AnalysisPage() {
   const [expandedRow, setExpandedRow] = useState<string | null>(null);
   const [sortKey, setSortKey] = useState<SortKey>("risk_score");
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+  const [results, setResults] = useState<InferenceResult[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const data = await api.getDemoData();
+        if (!alive) return;
+        setResults(data.results ?? []);
+      } catch (e) {
+        if (!alive) return;
+        setError(e instanceof Error ? e.message : "Failed to load analysis data");
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
 
   const handleSort = (key: SortKey) => {
     if (sortKey === key) {
@@ -91,7 +82,7 @@ export default function AnalysisPage() {
   };
 
   const sorted = useMemo(() => {
-    return [...mockResults].sort((a, b) => {
+    return [...results].sort((a, b) => {
       const aVal = a[sortKey];
       const bVal = b[sortKey];
       if (typeof aVal === "string" && typeof bVal === "string") {
@@ -103,7 +94,7 @@ export default function AnalysisPage() {
         ? (aVal as number) - (bVal as number)
         : (bVal as number) - (aVal as number);
     });
-  }, [sortKey, sortDir]);
+  }, [sortKey, sortDir, results]);
 
   return (
     <>
@@ -139,6 +130,16 @@ export default function AnalysisPage() {
           </div>
         </div>
 
+        {loading ? (
+          <div className="flex flex-col items-center justify-center py-16">
+            <Loader2 className="h-8 w-8 animate-spin text-primary" />
+            <p className="mt-3 text-sm text-muted-foreground">Loading analysis data...</p>
+          </div>
+        ) : error ? (
+          <div className="flex flex-col items-center justify-center py-16">
+            <p className="text-sm text-destructive">{error}</p>
+          </div>
+        ) : (<>
         {mode === "upload" && (
           <div className="glass flex flex-col items-center justify-center rounded-xl border-2 border-dashed border-border p-12">
             <Upload className="mb-3 h-10 w-10 text-muted-foreground" />
@@ -199,6 +200,7 @@ export default function AnalysisPage() {
             </table>
           </div>
         </div>
+        </>)}
       </div>
     </>
   );

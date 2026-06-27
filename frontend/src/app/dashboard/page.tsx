@@ -17,6 +17,7 @@ import {
   ShieldCheck,
   TrendingUp,
   Clock,
+  BarChart3,
 } from "lucide-react";
 import Header from "@/components/layout/Header";
 import { cn } from "@/lib/utils";
@@ -49,76 +50,13 @@ type StatCard = {
   tone?: "positive" | "neutral" | "negative";
 };
 
-const fallbackPerformance = [
-  { backbone: "GCN", f1: 0.91, auc: 0.95 },
-  { backbone: "GAT", f1: 0.93, auc: 0.96 },
-  { backbone: "GraphSAGE", f1: 0.94, auc: 0.97 },
-];
-
-const recentActivity = [
-  {
-    id: "SYNC-001",
-    action: "Latest model metadata loaded",
-    risk: "low",
-    time: "Live",
-  },
-  {
-    id: "SYNC-002",
-    action: "Calibration snapshot available",
-    risk: "medium",
-    time: "Live",
-  },
-  {
-    id: "SYNC-003",
-    action: "Fraud inference ready",
-    risk: "high",
-    time: "Live",
-  },
-];
-
-const riskColors: Record<string, string> = {
-  critical: "text-red-400 bg-red-400/10",
-  high: "text-orange-400 bg-orange-400/10",
-  medium: "text-amber-400 bg-amber-400/10",
-  low: "text-emerald-400 bg-emerald-400/10",
-};
-
 const CHART_COLORS = ["#6366f1", "#8b5cf6", "#22c55e", "#f59e0b"];
 
-const fallbackStats: StatCard[] = [
-  {
-    label: "Trained Models",
-    value: "6",
-    change: "Live",
-    icon: Activity,
-    color: "from-primary to-indigo-400",
-    tone: "neutral",
-  },
-  {
-    label: "Best Fraud F1",
-    value: "0.94",
-    change: "Target 0.75+",
-    icon: TrendingUp,
-    color: "from-emerald-500 to-teal-400",
-    tone: "positive",
-  },
-  {
-    label: "Best AUC",
-    value: "0.97",
-    change: "Latest run",
-    icon: ShieldCheck,
-    color: "from-violet-500 to-purple-400",
-    tone: "neutral",
-  },
-  {
-    label: "Calibration Sets",
-    value: "3",
-    change: "Conformal",
-    icon: AlertTriangle,
-    color: "from-amber-500 to-orange-400",
-    tone: "neutral",
-  },
-];
+type RecentActivity = {
+  id: string;
+  action: string;
+  time: string;
+};
 
 export default function DashboardPage() {
   const { user, loading: authLoading } = useAuth();
@@ -148,6 +86,8 @@ export default function DashboardPage() {
       alive = false;
     };
   }, [authLoading, user]);
+
+  const modelPerformance = summary?.model_performance?.length ? summary.model_performance : [];
 
   const stats: StatCard[] = summary
     ? [
@@ -184,10 +124,13 @@ export default function DashboardPage() {
           tone: "neutral",
         },
       ]
-    : fallbackStats;
+    : [];
 
-  const modelPerformance =
-    summary?.model_performance?.length ? summary.model_performance : fallbackPerformance;
+  const recentActivity: RecentActivity[] = modelPerformance.map((m, i) => ({
+    id: `MODEL-${String(i + 1).padStart(3, "0")}`,
+    action: `${m.backbone} — F1=${m.f1?.toFixed(3) ?? "N/A"} AUC=${m.auc?.toFixed(3) ?? "N/A"}`,
+    time: "Live",
+  }));
 
   return (
     <>
@@ -313,37 +256,34 @@ export default function DashboardPage() {
               Recent Activity
             </h2>
             <div className="space-y-3">
-              {recentActivity.map((entry) => (
-                <div
-                  key={entry.id}
-                  className="flex items-start gap-3 rounded-lg p-3 transition-colors hover:bg-secondary/50"
-                >
-                  <div className="mt-0.5">
-                    <Clock className="h-4 w-4 text-muted-foreground" />
-                  </div>
-                  <div className="flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm font-medium text-foreground">
-                        {entry.id}
-                      </span>
-                      <span
-                        className={cn(
-                          "rounded-full px-2 py-0.5 text-[10px] font-medium capitalize",
-                          riskColors[entry.risk]
-                        )}
-                      >
-                        {entry.risk}
-                      </span>
+                  {recentActivity.length > 0 ? recentActivity.map((entry) => (
+                    <div
+                      key={entry.id}
+                      className="flex items-start gap-3 rounded-lg p-3 transition-colors hover:bg-secondary/50"
+                    >
+                      <div className="mt-0.5">
+                        <Clock className="h-4 w-4 text-muted-foreground" />
+                      </div>
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-medium text-foreground">
+                            {entry.id}
+                          </span>
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          {entry.action}
+                        </p>
+                        <p className="mt-0.5 text-[10px] text-muted-foreground/60">
+                          {entry.time}
+                        </p>
+                      </div>
                     </div>
-                    <p className="text-xs text-muted-foreground">
-                      {entry.action}
-                    </p>
-                    <p className="mt-0.5 text-[10px] text-muted-foreground/60">
-                      {entry.time}
-                    </p>
-                  </div>
-                </div>
-              ))}
+                  )) : (
+                    <div className="flex flex-col items-center justify-center py-8 text-center">
+                      <Clock className="mb-2 h-8 w-8 text-muted-foreground/40" />
+                      <p className="text-sm text-muted-foreground">No activity yet</p>
+                    </div>
+                  )}
             </div>
           </div>
         </div>

@@ -27,7 +27,7 @@ from sklearn.metrics import f1_score
 from torch_geometric.data import Data
 from torch_geometric.nn import SAGEConv, GATConv, GCNConv, LayerNorm
 from safetensors.torch import save_file
-from huggingface_hub import HfApi, login
+from huggingface_hub import HfApi, hf_hub_download, login
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "PLACEHOLDER_HF_TOKEN")
 if "PLACEHOLDER" in HF_TOKEN:
@@ -226,7 +226,7 @@ def train_edl(model, data, device):
     data = data.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS)
-    best_f1, best_state, cnt = 0.0, None, 0
+    best_f1, best_state, cnt = -1.0, {k: v.cpu().clone() for k, v in model.state_dict().items()}, 0
     for epoch in range(EPOCHS):
         model.train(); optimizer.zero_grad()
         alpha = model(data.x, data.edge_index)
@@ -257,8 +257,14 @@ def compute_aps(probs, tl):
     return float(np.sum(sp[sp > probs[tl]]) + xi * probs[tl])
 
 def calibrate(probs, data):
-    vp, vl = probs[data.val_mask.numpy()], data.y[data.val_mask].numpy()
+    val_mask = data.val_mask.detach().cpu().numpy()
+    test_mask = data.test_mask.detach().cpu().numpy()
+    labels = data.y.detach().cpu().numpy()
+    vp, vl = probs[val_mask], labels[val_mask]
     n = len(vl)
+    if n == 0:
+        return {"quantile_threshold": 1.0, "mondrian_thresholds": {}, "alpha": 0.1,
+                "coverage_rate": 0.0, "calibration_size": 0}
     scores = np.array([compute_aps(vp[i], vl[i]) for i in range(n)])
     ALPHA = 0.1
     ql = min(np.ceil((n + 1) * (1 - ALPHA)) / n, 1.0)
@@ -271,7 +277,10 @@ def calibrate(probs, data):
             nc = len(cs)
             qc = min(np.ceil((nc + 1) * (1 - ALPHA)) / nc, 1.0)
             mondrian[str(c)] = float(np.quantile(cs, qc))
-    tp, tl = probs[data.test_mask.numpy()], data.y[data.test_mask].numpy()
+    tp, tl = probs[test_mask], labels[test_mask]
+    if len(tl) == 0:
+        return {"quantile_threshold": 1.0, "mondrian_thresholds": mondrian, "alpha": ALPHA,
+                "coverage_rate": 0.0, "calibration_size": n}
     covered = 0
     for i in range(len(tl)):
         p, xi = tp[i], np.random.uniform(0, 1)
@@ -311,8 +320,8 @@ def main():
                 alpha = model(data.x.to(device), data.edge_index.to(device))
                 test_a = alpha[data.test_mask].cpu()
                 S = test_a.sum(dim=1)
-                pred = (test_a / S.unsqueeze(1)).argmax(dim=1).numpy()
-                true = data.y[data.test_mask].numpy()
+                pred = (test_a / S.unsqueeze(1)).argmax(dim=1).cpu().numpy()
+                true = data.y[data.test_mask].detach().cpu().numpy()
             metrics = {"f1_macro": float(f1_score(true, pred, average='macro', zero_division=0)),
                        "mean_vacuity": float((2.0 / S).mean().item())}
             print(f"  F1_macro={metrics['f1_macro']:.4f} Vacuity={metrics['mean_vacuity']:.4f}")

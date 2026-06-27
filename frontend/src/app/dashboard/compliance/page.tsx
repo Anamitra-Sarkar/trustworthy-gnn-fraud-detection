@@ -1,82 +1,11 @@
 "use client";
 
-import { useState } from "react";
-import { Shield, FileText, ChevronRight, Plus, X } from "lucide-react";
+import { useState, useEffect } from "react";
+import { Shield, FileText, ChevronRight, Plus, X, Loader2 } from "lucide-react";
 import Header from "@/components/layout/Header";
 import ReportViewer from "@/components/compliance/ReportViewer";
 import { cn } from "@/lib/utils";
-import type { ComplianceReport } from "@/types";
-
-const mockReports: ComplianceReport[] = [
-  {
-    id: "RPT-001",
-    node_id: "TXN-2003",
-    risk_classification: "critical",
-    prediction: 1,
-    confidence: 0.94,
-    risk_score: 0.92,
-    escalation_status: "pending",
-    generated_at: new Date(Date.now() - 3600000).toISOString(),
-    summary:
-      "High-confidence fraud detection with strong evidential support. Transaction exhibits anomalous graph centrality patterns consistent with known money laundering schemes. Dirichlet strength indicates low model uncertainty.",
-    key_metrics: {
-      dirichlet_strength: 14.2,
-      graph_centrality: 0.87,
-      anomaly_score: 0.91,
-    },
-  },
-  {
-    id: "RPT-002",
-    node_id: "TXN-2007",
-    risk_classification: "high",
-    prediction: 1,
-    confidence: 0.82,
-    risk_score: 0.78,
-    escalation_status: "reviewing",
-    generated_at: new Date(Date.now() - 7200000).toISOString(),
-    summary:
-      "Moderate-to-high fraud probability with elevated uncertainty. Graph neighborhood analysis reveals connections to previously flagged entities. Further review recommended.",
-    key_metrics: {
-      dirichlet_strength: 8.5,
-      graph_centrality: 0.65,
-      anomaly_score: 0.73,
-    },
-  },
-  {
-    id: "RPT-003",
-    node_id: "TXN-2011",
-    risk_classification: "medium",
-    prediction: 0,
-    confidence: 0.71,
-    risk_score: 0.45,
-    escalation_status: "resolved",
-    generated_at: new Date(Date.now() - 86400000).toISOString(),
-    summary:
-      "Borderline classification with notable uncertainty. Node features within normal range but graph structure shows weak anomalous patterns. Cleared after manual review.",
-    key_metrics: {
-      dirichlet_strength: 5.1,
-      graph_centrality: 0.42,
-      anomaly_score: 0.38,
-    },
-  },
-  {
-    id: "RPT-004",
-    node_id: "TXN-2015",
-    risk_classification: "low",
-    prediction: 0,
-    confidence: 0.96,
-    risk_score: 0.12,
-    escalation_status: "dismissed",
-    generated_at: new Date(Date.now() - 172800000).toISOString(),
-    summary:
-      "Low risk with high model confidence. Transaction patterns consistent with legitimate activity. No anomalous graph features detected.",
-    key_metrics: {
-      dirichlet_strength: 18.3,
-      graph_centrality: 0.15,
-      anomaly_score: 0.08,
-    },
-  },
-];
+import { api } from "@/lib/api";
 
 const riskColors: Record<string, string> = {
   critical: "border-red-500/30 bg-red-500/5",
@@ -100,17 +29,62 @@ const statusBadge: Record<string, string> = {
 };
 
 export default function CompliancePage() {
-  const [selectedReport, setSelectedReport] =
-    useState<ComplianceReport | null>(null);
+  const [selectedReport, setSelectedReport] = useState<Record<string, unknown> | null>(null);
+  const [reports, setReports] = useState<Record<string, unknown>[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const data = await api.getEscalations();
+        if (!alive) return;
+        const escalated = Array.isArray(data) ? data : [];
+        const reportsWithMeta = escalated.map((e: Record<string, unknown>, i: number) => ({
+          id: e.id ?? `RPT-${String(i + 1).padStart(3, "0")}`,
+          node_id: e.node_id ?? "Unknown",
+          risk_classification: (e.priority === "critical" || e.priority === "high")
+            ? "high" : "medium",
+          prediction: ((e.risk_score as number) ?? 0) > 0.5 ? 1 : 0,
+          confidence: Math.min(1, ((e.risk_score as number) ?? 0) + 0.3),
+          risk_score: e.risk_score ?? 0,
+          escalation_status: e.status ?? "pending",
+          generated_at: e.created_at ?? new Date().toISOString(),
+          summary: (e.reason as string) ?? "No summary available",
+          key_metrics: {
+            risk_score: (e.risk_score as number) ?? 0,
+          },
+        }));
+        setReports(reportsWithMeta);
+      } catch (e) {
+        if (!alive) return;
+        setError(e instanceof Error ? e.message : "Failed to load compliance reports");
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+    return () => { alive = false; };
+  }, []);
 
   return (
     <>
       <Header title="Compliance Reports" />
       <div className="space-y-6 p-6">
+        {loading ? (
+          <div className="flex flex-col items-center justify-center py-16">
+            <Loader2 className="h-8 w-8 animate-spin text-primary" />
+            <p className="mt-3 text-sm text-muted-foreground">Loading compliance reports...</p>
+          </div>
+        ) : error ? (
+          <div className="flex flex-col items-center justify-center py-16">
+            <p className="text-sm text-destructive">{error}</p>
+          </div>
+        ) : (<>
         {/* Actions */}
         <div className="flex items-center justify-between">
           <p className="text-sm text-muted-foreground">
-            {mockReports.length} compliance reports generated
+            {reports.length} compliance reports generated
           </p>
           <button className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white hover:bg-primary/90">
             <Plus className="h-4 w-4" />
@@ -121,14 +95,21 @@ export default function CompliancePage() {
         <div className="flex gap-6">
           {/* Report Cards */}
           <div className="flex-1 space-y-4">
-            {mockReports.map((report) => (
+            {reports.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-16 text-center">
+                <FileText className="mb-3 h-10 w-10 text-muted-foreground/40" />
+                <p className="text-sm text-muted-foreground">No compliance reports yet</p>
+              </div>
+            ) : reports.map((report: Record<string, unknown>) => {
+              const r = report as Record<string, string | number>;
+              return (
               <button
-                key={report.id}
+                key={r.id as string}
                 onClick={() => setSelectedReport(report)}
                 className={cn(
                   "w-full rounded-xl border p-5 text-left transition-all hover:border-primary/30",
-                  riskColors[report.risk_classification],
-                  selectedReport?.id === report.id && "ring-1 ring-primary/50"
+                  riskColors[r.risk_classification as string] ?? "",
+                  selectedReport?.id === r.id && "ring-1 ring-primary/50"
                 )}
               >
                 <div className="flex items-start justify-between">
@@ -138,10 +119,10 @@ export default function CompliancePage() {
                     </div>
                     <div>
                       <p className="font-medium text-foreground">
-                        {report.node_id}
+                        {r.node_id as string}
                       </p>
                       <p className="text-xs text-muted-foreground">
-                        {report.id}
+                        {r.id as string}
                       </p>
                     </div>
                   </div>
@@ -149,10 +130,10 @@ export default function CompliancePage() {
                     <span
                       className={cn(
                         "rounded-full px-2.5 py-0.5 text-xs font-medium capitalize",
-                        riskBadge[report.risk_classification]
+                        riskBadge[r.risk_classification as string] ?? ""
                       )}
                     >
-                      {report.risk_classification}
+                      {r.risk_classification as string}
                     </span>
                     <ChevronRight className="h-4 w-4 text-muted-foreground" />
                   </div>
@@ -160,22 +141,23 @@ export default function CompliancePage() {
                 <div className="mt-3 flex items-center gap-4 text-xs text-muted-foreground">
                   <span className="flex items-center gap-1">
                     <Shield className="h-3 w-3" />
-                    {(report.confidence * 100).toFixed(0)}% confidence
+                    {((r.confidence as number) * 100).toFixed(0)}% confidence
                   </span>
                   <span
                     className={cn(
                       "capitalize",
-                      statusBadge[report.escalation_status]
+                      statusBadge[r.escalation_status as string] ?? ""
                     )}
                   >
-                    {report.escalation_status}
+                    {r.escalation_status as string}
                   </span>
                   <span>
-                    {new Date(report.generated_at).toLocaleDateString()}
+                    {new Date(r.generated_at as string).toLocaleDateString()}
                   </span>
                 </div>
               </button>
-            ))}
+              );
+            })}
           </div>
 
           {/* Report Detail */}
@@ -190,10 +172,11 @@ export default function CompliancePage() {
                   <X className="h-4 w-4" />
                 </button>
               </div>
-              <ReportViewer report={selectedReport} />
+              <ReportViewer report={selectedReport as never} />
             </div>
           )}
         </div>
+        </>)}
       </div>
     </>
   );

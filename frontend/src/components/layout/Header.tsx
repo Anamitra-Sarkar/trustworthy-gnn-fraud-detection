@@ -1,6 +1,7 @@
 "use client";
 
-import { Bell, Search } from "lucide-react";
+import { Bell, Search, Sun, Moon } from "lucide-react";
+import { useTheme } from "next-themes";
 import { useAuth } from "@/hooks/useAuth";
 
 interface HeaderProps {
@@ -9,6 +10,7 @@ interface HeaderProps {
 
 export default function Header({ title }: HeaderProps) {
   const { user } = useAuth();
+  const { theme, setTheme } = useTheme();
 
   return (
     <header className="sticky top-0 z-30 flex h-16 items-center justify-between border-b border-border bg-card/80 px-6 backdrop-blur-md">
@@ -29,6 +31,19 @@ export default function Header({ title }: HeaderProps) {
         <button className="relative rounded-lg p-2 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground">
           <Bell className="h-5 w-5" />
           <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-destructive" />
+        </button>
+
+        {/* Theme Toggle */}
+        <button
+          onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+          className="rounded-lg p-2 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+          title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+        >
+          {theme === "dark" ? (
+            <Sun className="h-5 w-5" />
+          ) : (
+            <Moon className="h-5 w-5" />
+          )}
         </button>
 
         {/* Avatar */}

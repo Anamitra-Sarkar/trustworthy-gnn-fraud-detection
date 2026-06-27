@@ -386,8 +386,8 @@ def train_model(model, data, device):
     scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[10])
 
     criterion = FocalLoss(alpha=alpha, gamma=2.0, label_smoothing=LABEL_SMOOTHING)
-    best_f1 = 0.0
-    best_state = None
+    best_f1 = -1.0
+    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
     cnt = 0
     for epoch in range(EPOCHS):
         model.train()
@@ -457,6 +457,9 @@ def calibrate(model, data, device, name):
         probs = F.softmax(model(data_dev.x, data_dev.edge_index), dim=-1).cpu().numpy()
     vp, vl = probs[val_mask], data.y[data.val_mask].detach().cpu().numpy()
     n = len(vl)
+    if n == 0:
+        return {"quantile_threshold": 1.0, "mondrian_thresholds": {}, "alpha": 0.1,
+                "coverage_rate": 0.0, "calibration_size": 0}
     scores = np.array([compute_aps(vp[i], vl[i]) for i in range(n)])
     ALPHA = 0.1
     ql = min(np.ceil((n + 1) * (1 - ALPHA)) / n, 1.0)
@@ -470,6 +473,9 @@ def calibrate(model, data, device, name):
             qc = min(np.ceil((nc + 1) * (1 - ALPHA)) / nc, 1.0)
             mondrian[str(c)] = float(np.quantile(cs, qc))
     tp, tl = probs[test_mask], data.y[data.test_mask].detach().cpu().numpy()
+    if len(tl) == 0:
+        return {"quantile_threshold": 1.0, "mondrian_thresholds": mondrian, "alpha": ALPHA,
+                "coverage_rate": 0.0, "calibration_size": n}
     covered = 0
     for i in range(len(tl)):
         p, xi = tp[i], np.random.uniform(0, 1)

@@ -9,40 +9,14 @@ import {
   Circle,
   Loader2,
   X,
+  AlertCircle,
 } from "lucide-react";
 import Header from "@/components/layout/Header";
 import TransactionGraph from "@/components/graph/TransactionGraph";
 import UncertaintyGauge from "@/components/uncertainty/UncertaintyGauge";
 import { cn } from "@/lib/utils";
+import { api } from "@/lib/api";
 import type { GraphNode, GraphEdge } from "@/types";
-
-// Demo data generator
-function generateDemoData(): { nodes: GraphNode[]; edges: GraphEdge[] } {
-  const nodes: GraphNode[] = [];
-  const edges: GraphEdge[] = [];
-
-  for (let i = 0; i < 60; i++) {
-    const riskScore = Math.random();
-    nodes.push({
-      id: `n${i}`,
-      label: `TXN-${1000 + i}`,
-      risk_score: riskScore,
-      prediction: riskScore > 0.5 ? 1 : 0,
-      degree: Math.floor(Math.random() * 8) + 1,
-    });
-  }
-
-  for (let i = 0; i < 90; i++) {
-    const source = `n${Math.floor(Math.random() * 60)}`;
-    let target = `n${Math.floor(Math.random() * 60)}`;
-    while (target === source) {
-      target = `n${Math.floor(Math.random() * 60)}`;
-    }
-    edges.push({ source, target, weight: Math.random() });
-  }
-
-  return { nodes, edges };
-}
 
 export default function GraphExplorerPage() {
   const [nodes, setNodes] = useState<GraphNode[]>([]);
@@ -51,16 +25,24 @@ export default function GraphExplorerPage() {
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [loading, setLoading] = useState(true);
   const [riskFilter, setRiskFilter] = useState(0);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    // Simulate loading demo data
-    const timer = setTimeout(() => {
-      const data = generateDemoData();
-      setNodes(data.nodes);
-      setEdges(data.edges);
-      setLoading(false);
-    }, 500);
-    return () => clearTimeout(timer);
+    let alive = true;
+    (async () => {
+      try {
+        const data = await api.getDemoData();
+        if (!alive) return;
+        setNodes(data.nodes ?? []);
+        setEdges(data.edges ?? []);
+      } catch (e) {
+        if (!alive) return;
+        setError(e instanceof Error ? e.message : "Failed to load graph data");
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+    return () => { alive = false; };
   }, []);
 
   const handleNodeSelect = useCallback((node: GraphNode) => {
@@ -156,6 +138,17 @@ export default function GraphExplorerPage() {
                 Loading graph data...
               </p>
             </div>
+          </div>
+        ) : error ? (
+          <div className="flex flex-1 items-center justify-center">
+            <div className="flex flex-col items-center gap-3">
+              <AlertCircle className="h-8 w-8 text-destructive" />
+              <p className="text-sm text-destructive">{error}</p>
+            </div>
+          </div>
+        ) : nodes.length === 0 ? (
+          <div className="flex flex-1 items-center justify-center">
+            <p className="text-sm text-muted-foreground">No graph data available</p>
           </div>
         ) : (
           <div className="flex-1">

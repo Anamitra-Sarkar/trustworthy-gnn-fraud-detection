@@ -146,7 +146,7 @@ export default function TransactionGraph({
   return (
     <div
       ref={containerRef}
-      className="h-full w-full rounded-lg bg-[#030712]"
+      className="h-full w-full rounded-lg bg-background"
       style={{ minHeight: "500px" }}
     />
   );
