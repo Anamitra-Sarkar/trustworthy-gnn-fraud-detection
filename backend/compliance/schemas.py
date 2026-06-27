@@ -64,8 +64,9 @@ class InferenceResponse(BaseModel):
 
 
 class BatchInferenceRequest(BaseModel):
-    nodes: List[dict] = Field(description="List of {id, features} dicts.")
-    edges: List[List[int]] = Field(description="Edge list [[src,dst],...].")
+    nodes: Optional[List[dict]] = Field(default=None, description="List of {id, features} dicts. Alternative to feature_matrix.")
+    edges: Optional[List[List[int]]] = Field(default=None, description="Edge list [[src,dst],...]. Empty if not provided.")
+    feature_matrix: Optional[List[List[float]]] = Field(default=None, description="Flat feature matrix [[f1,f2,...],...]. Auto-converted to nodes if nodes not provided.")
     model_name: str = Field(default="graphsage_original_elliptic")
     uncertainty_method: Literal["conformal", "evidential", "mc_dropout", "all"] = Field(default="all")
 

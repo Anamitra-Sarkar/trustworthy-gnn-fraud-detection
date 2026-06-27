@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timezone
 import numpy as np
 import torch
 from fastapi import APIRouter, Header, HTTPException, Depends
@@ -91,10 +92,19 @@ async def infer_batch(request: BatchInferenceRequest, authorization: str = Heade
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    nodes = request.nodes
+    if nodes is None and request.feature_matrix is not None:
+        nodes = [{"id": i, "features": row} for i, row in enumerate(request.feature_matrix)]
+    if nodes is None:
+        raise HTTPException(status_code=400, detail="Provide either 'nodes' or 'feature_matrix'")
+
     features = torch.tensor(
-        [node["features"] for node in request.nodes], dtype=torch.float32
+        [node["features"] for node in nodes], dtype=torch.float32
     )
-    edge_index = torch.tensor(request.edges, dtype=torch.long).T
+    if request.edges:
+        edge_index = torch.tensor(request.edges, dtype=torch.long).T
+    else:
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
 
     model.eval()
     is_edl = "edl" in request.model_name
@@ -106,37 +116,60 @@ async def infer_batch(request: BatchInferenceRequest, authorization: str = Heade
     if is_edl:
         alpha_batch = logits.cpu().numpy()
         edl_results = edl_analyzer.batch_analyze(alpha_batch)
-        for i, node in enumerate(request.nodes):
+        for i, node in enumerate(nodes):
             probs = np.array(edl_results[i]["expected_probs"])
-            prediction = "Fraud" if np.argmax(probs) == 1 else "Licit"
+            pred_int = int(np.argmax(probs))
+            prob_val = float(np.max(probs))
+            risk_val = float(probs[1]) if len(probs) > 1 else 0.0
+            ev = edl_results[i]
+            evidential_result = {
+                "belief": float(ev["beliefs"][0]) if len(ev["beliefs"]) > 0 else 0.0,
+                "disbelief": float(ev["beliefs"][1]) if len(ev["beliefs"]) > 1 else 0.0,
+                "uncertainty": float(ev["vacuity"]),
+                "base_rate": 0.5,
+                "alpha": ev["alpha"],
+                "dirichlet_strength": float(ev["dirichlet_strength"]),
+            }
             results.append({
-                "node_id": node.get("id", i),
-                "prediction": prediction,
-                "confidence": float(np.max(probs)),
-                "risk_score": float(probs[1]) if len(probs) > 1 else 0.0,
-                "uncertainty": {"evidential": edl_results[i]},
+                "node_id": str(node.get("id", i)),
+                "prediction": pred_int,
+                "label": "Fraud" if pred_int == 1 else "Licit",
+                "probability": prob_val,
+                "risk_score": risk_val,
+                "backbone": request.model_name,
+                "uncertainty": {
+                    "confidence": prob_val,
+                    "method": "evidential",
+                    "evidential": evidential_result,
+                },
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             })
     else:
         probs_batch = torch.softmax(logits, dim=-1).cpu().numpy()
-        for i, node in enumerate(request.nodes):
+        for i, node in enumerate(nodes):
             probs = probs_batch[i]
-            prediction = "Fraud" if np.argmax(probs) == 1 else "Licit"
-            uncertainty = {}
+            pred_int = int(np.argmax(probs))
+            prob_val = float(np.max(probs))
+            risk_val = float(probs[1]) if len(probs) > 1 else 0.0
+            uncertainty = {"confidence": prob_val, "method": request.uncertainty_method}
             if request.uncertainty_method in ("conformal", "all"):
                 uncertainty["conformal"] = conformal_pred.predict(probs)
             results.append({
-                "node_id": node.get("id", i),
-                "prediction": prediction,
-                "confidence": float(np.max(probs)),
-                "risk_score": float(probs[1]) if len(probs) > 1 else 0.0,
+                "node_id": str(node.get("id", i)),
+                "prediction": pred_int,
+                "label": "Fraud" if pred_int == 1 else "Licit",
+                "probability": prob_val,
+                "risk_score": risk_val,
+                "backbone": request.model_name,
                 "uncertainty": uncertainty,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             })
 
     analysis_id = str(uuid.uuid4())
     save_analysis(analysis_id, uid, {
         "batch_results": results,
         "model_name": request.model_name,
-        "num_nodes": len(request.nodes),
+        "num_nodes": len(nodes),
     })
 
     return {"analysis_id": analysis_id, "results": results}
@@ -149,28 +182,43 @@ async def demo_elliptic(authorization: str = Header(...)):
 
     np.random.seed(42)
     num_demo_nodes = 50
-    demo_results = []
+    demo_nodes = []
+    demo_inference_results = []
     for i in range(num_demo_nodes):
-        risk = np.random.beta(2, 5)
+        risk = float(np.random.beta(2, 5))
         is_fraud = risk > 0.6
-        demo_results.append({
-            "node_id": i,
-            "prediction": "Fraud" if is_fraud else "Licit",
-            "confidence": float(0.7 + np.random.random() * 0.25),
-            "risk_score": float(risk),
+        pred_int = 1 if is_fraud else 0
+        prob = float(0.7 + np.random.random() * 0.25)
+        demo_nodes.append({
+            "id": str(i),
+            "label": "Fraud" if is_fraud else "Licit",
+            "risk_score": risk,
+            "prediction": pred_int,
+            "degree": int(np.random.randint(1, 50)),
+        })
+        demo_inference_results.append({
+            "node_id": str(i),
+            "prediction": pred_int,
+            "label": "Fraud" if is_fraud else "Licit",
+            "probability": prob,
+            "risk_score": risk,
+            "backbone": "graphsage_original_elliptic",
             "uncertainty": {
+                "confidence": prob,
+                "method": "all",
                 "conformal": {
-                    "conformal_prediction_set": [1] if is_fraud else [0],
-                    "prediction_set_cardinality": 1 + (1 if risk > 0.4 and risk < 0.65 else 0),
-                    "quantile_threshold": 0.342,
-                    "coverage_guarantee_valid": True,
+                    "prediction_set": [1] if is_fraud else [0],
+                    "set_size": 1 + (1 if 0.4 < risk < 0.65 else 0),
+                    "confidence_level": 0.9,
+                    "coverage": 0.912,
                 },
                 "evidential": {
-                    "vacuity": float(np.random.beta(2, 8)),
-                    "dissonance": float(np.random.beta(1, 10)),
-                    "beliefs": [float(1 - risk), float(risk)],
-                    "licit_evidence": float((1 - risk) * 10),
-                    "fraud_evidence": float(risk * 10),
+                    "belief": float(1 - risk),
+                    "disbelief": float(risk),
+                    "uncertainty": float(np.random.beta(2, 8)),
+                    "base_rate": 0.5,
+                    "alpha": [float((1 - risk) * 10), float(risk * 10)],
+                    "dirichlet_strength": 10.0,
                 },
                 "mc_dropout": {
                     "epistemic_uncertainty": float(np.random.beta(2, 10)),
@@ -178,8 +226,7 @@ async def demo_elliptic(authorization: str = Header(...)):
                     "total_uncertainty": float(np.random.beta(2, 6)),
                 }
             },
-            "degree": int(np.random.randint(1, 50)),
-            "timestep": int(np.random.randint(35, 49)),
+            "timestamp": "2026-06-27T12:00:00Z",
         })
 
     demo_edges = []
@@ -188,12 +235,20 @@ async def demo_elliptic(authorization: str = Header(...)):
         for _ in range(num_connections):
             j = np.random.randint(0, num_demo_nodes)
             if j != i:
-                demo_edges.append([i, j])
+                demo_edges.append({"source": str(i), "target": str(j)})
 
     return {
         "dataset": "elliptic_bitcoin",
-        "nodes": demo_results,
+        "nodes": demo_nodes,
         "edges": demo_edges,
+        "results": demo_inference_results,
+        "metadata": {
+            "dataset": "elliptic_bitcoin",
+            "total_nodes": num_demo_nodes,
+            "total_edges": len(demo_edges),
+            "flagged_count": sum(1 for r in demo_inference_results if r["prediction"] == 1),
+            "backbone": "graphsage_original_elliptic",
+        },
         "metrics": {
             "ece": 0.042,
             "brier_score": 0.128,
